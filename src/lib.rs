@@ -21,9 +21,8 @@ use iroh_relay::client::{Client, ClientBuilder};
 use iroh_relay::protos::relay::{
     ClientToRelayMsg as Out, Datagrams, RelayToClientMsg as In,
 };
-use rustls::crypto::aws_lc_rs::{default_provider, kx_group::X25519MLKEM768};
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
@@ -176,13 +175,9 @@ async fn connect(relay: &RelayUrl, sk: SecretKey) -> Result<Client> {
         relay.scheme() == "https" || local,
         "{relay}: a relay is reached by https"
     );
-    // The hybrid alone: a relay without it is refused, not met classically,
-    // for this hop hides who is sent to from a recording.
-    let pq = rustls::crypto::CryptoProvider {
-        kx_groups: vec![X25519MLKEM768],
-        ..default_provider()
-    };
-    let tls = roots().client_config(Arc::new(pq))?;
+    // irnet's hybrid alone: a relay without it is refused, not met
+    // classically, for this hop hides who is sent to from a recording.
+    let tls = roots().client_config(irnet::pq())?;
     let b = ClientBuilder::new(
         relay.clone(),
         sk,

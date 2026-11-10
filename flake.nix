@@ -30,7 +30,7 @@
           pname = "pushir";
           version = "0.3.0";
           src = fs.toSource { root = ./.; fileset = fs.unions [ ./Cargo.toml ./Cargo.lock ./src ]; };
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = { lockFile = ./Cargo.lock; allowBuiltinFetchGit = true; }; # irnet, by its commit
           doCheck = false;
         };
         iroh-relay = relay pkgs "iroh-relay" [ ] [ ];                                # stock: iroh data relay

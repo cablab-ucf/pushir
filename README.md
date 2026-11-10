@@ -42,8 +42,12 @@ pushir send LANE < m     # PUSHIR_RELAY (default irpush.cxn.center), PUSHIR_SOCK
   data and far less on Wi-Fi); a ping left
   unanswered means a NAT forgot the connection in that time, and the wait
   closes in on that limit from below. Any frame resets the silence.
-- TLS 1.3 to the relay with X25519MLKEM768 and nothing else: a relay
-  without it is refused. `http` only to this machine.
+- TLS 1.3 to the relay with X25519MLKEM768 and nothing else (irnet's
+  `pq`, the one post-quantum setup these crates share; pushir takes that
+  alone, not irnet's endpoint): a relay without it is refused. `http` only
+  to this machine.
+- pushir carries hints. What a hint announces is fetched over an irnet
+  connection, proved by `irnet::psk` and as fast as QUIC goes.
 - One connection carries a batch (`Sender`): a storage node ringing a
   hundred phones makes one handshake, not a hundred.
 
