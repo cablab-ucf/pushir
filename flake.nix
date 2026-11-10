@@ -1,5 +1,5 @@
 {
-  description = "irpush: a relay mailbox, plus its relay VPS";
+  description = "pushir: a relay mailbox, plus its relay VPS";
 
   inputs = {
     # Pinned by flake.lock; `make bump` moves both.
@@ -25,20 +25,22 @@
       };
     in {
       packages = each (system: let pkgs = pkgsFor system; in {
-        default = self.packages.${system}.irpush;
-        irpush = pkgs.rustPlatform.buildRustPackage {
-          pname = "irpush";
-          version = "0.2.0";
+        default = self.packages.${system}.pushir;
+        pushir = pkgs.rustPlatform.buildRustPackage {
+          pname = "pushir";
+          version = "0.3.0";
           src = fs.toSource { root = ./.; fileset = fs.unions [ ./Cargo.toml ./Cargo.lock ./src ]; };
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = { lockFile = ./Cargo.lock; allowBuiltinFetchGit = true; }; # irnet, by its commit
           doCheck = false;
         };
         iroh-relay = relay pkgs "iroh-relay" [ ] [ ];                                # stock: iroh data relay
         # server ping after 130 min of client silence (clients drive heartbeats); TLS by aws-lc-rs with
         # X25519MLKEM768 first, so the relay hop is post-quantum (stock iroh-relay: ring, X25519 only);
-        # a key in $RELAY_KEYS lifts the rate limit (big transfers that cannot go direct)
+        # a key in $RELAY_KEYS lifts the rate limit (big transfers that cannot go direct); a pushir frame is
+        # kept until its mailbox pongs it (64 each, 65,536 in all, a day), 64 at once then one a second
         irpush-relay = relay pkgs "irpush-relay"
-          [ ./deploy/relay-ping.patch ./deploy/relay-pq.patch ./deploy/relay-unlimited.patch ] [ "tls-aws-lc-rs" ];
+          [ ./deploy/relay-ping.patch ./deploy/relay-pq.patch ./deploy/relay-unlimited.patch ./deploy/relay-hold.patch ]
+          [ "tls-aws-lc-rs" ];
       });
 
       nixosModules.relays = import ./deploy/relays.nix self;

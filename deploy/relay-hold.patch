@@ -1,0 +1,328 @@
+diff --git a/src/server/client.rs b/src/server/client.rs
+index 32c77f7..b375007 100644
+--- a/src/server/client.rs
++++ b/src/server/client.rs
+@@ -1,6 +1,10 @@
+ //! The server-side representation of an ongoing client relaying connection.
+ 
+-use std::{collections::HashSet, sync::Arc, time::Duration};
++use std::{
++    collections::HashSet,
++    sync::{Arc, Mutex},
++    time::{Duration, Instant},
++};
+ 
+ use iroh_base::EndpointId;
+ use n0_error::{e, stack_error};
+@@ -9,6 +13,7 @@ use rand::RngExt;
+ use time::{Date, OffsetDateTime};
+ use tokio::{
+     sync::{
++        Notify,
+         mpsc::{self, error::TrySendError},
+         watch,
+     },
+@@ -111,8 +116,15 @@ pub(super) struct Client {
+     message_queue: mpsc::Sender<RelayToClientMsg>,
+     /// Relay protocol version negotiated for this client.
+     protocol_version: ProtocolVersion,
++    /// pushir: tells the actor that frames are held for this client.
++    hints: Arc<Notify>,
++    /// pushir: how many frames it may be handed now, and as of when.
++    budget: Mutex<(f64, Instant)>,
+ }
+ 
++/// pushir: how long a client may take to pong the frames it was handed.
++const HINT_PONG: Duration = Duration::from_secs(30);
++
+ impl Client {
+     /// Creates a client from a connection & starts a read and write loop to handle io to and from
+     /// the client
+@@ -139,6 +151,7 @@ impl Client {
+         let (packet_send_queue_s, packet_send_queue_r) = mpsc::channel(channel_capacity);
+         let (message_send_queue_s, message_send_queue_r) = mpsc::channel(channel_capacity);
+         let done = CancellationToken::new();
++        let hints = Arc::new(Notify::new());
+ 
+         let actor = Actor {
+             stream,
+@@ -152,6 +165,10 @@ impl Client {
+             protocol_version,
+             rate_limited,
+             metrics,
++            hints: Hints {
++                wake: hints.clone(),
++                ..Default::default()
++            },
+         };
+ 
+         // start io loop
+@@ -170,7 +187,31 @@ impl Client {
+             packet_queue: packet_send_queue_s,
+             message_queue: message_send_queue_s,
+             protocol_version,
++            hints,
++            budget: Mutex::new((64.0, Instant::now())),
++        }
++    }
++
++    pub(super) fn hints(&self) -> Arc<Notify> {
++        self.hints.clone()
++    }
++
++    pub(super) fn wake_hints(&self) {
++        self.hints.notify_one();
++    }
++
++    /// pushir: whether one more frame may be handed over now: 64 at once, then
++    /// one a second, so no sender keeps a phone awake at the relay's full rate.
++    pub(super) fn hint_budget(&self) -> bool {
++        let mut b = self.budget.lock().expect("poisoned");
++        let now = Instant::now();
++        b.0 = (b.0 + now.duration_since(b.1).as_secs_f64()).min(64.0);
++        b.1 = now;
++        let ok = b.0 >= 1.0;
++        if ok {
++            b.0 -= 1.0;
+         }
++        ok
+     }
+ 
+     pub(super) fn connection_id(&self) -> ConnectionId {
+@@ -337,6 +378,19 @@ struct Actor<S> {
+     /// Optional signal counting how often the connection has been rate-limited.
+     rate_limited: Option<watch::Receiver<u64>>,
+     metrics: Arc<Metrics>,
++    hints: Hints,
++}
++
++/// pushir: the frames held for this client, as its actor sees them.
++#[derive(Debug, Default)]
++struct Hints {
++    /// Told when frames are held.
++    wake: Arc<Notify>,
++    /// The last one handed over on this connection, and the last one ponged.
++    sent: Option<u64>,
++    acked: Option<u64>,
++    /// The ping out, and the last frame handed over before it.
++    ping: Option<([u8; 8], u64)>,
+ }
+ 
+ impl<S> Actor<S>
+@@ -421,6 +475,24 @@ where
+                         .await
+                         .map_err(|err| e!(RunError::WriteFrame, err))?;
+                 }
++                // pushir: hand over the frames held for this client, then ping: its
++                // pong tells they arrived, and until then they stay held.
++                _ = self.hints.wake.notified() => {
++                    let id = self.guard.endpoint_id();
++                    for (n, src, data) in self.clients.pending(id, self.hints.sent) {
++                        self.send_packet(Packet { src, data })
++                            .await
++                            .map_err(|err| e!(RunError::PacketSend, err))?;
++                        self.hints.sent = Some(n);
++                    }
++                    if self.hints.ping.is_none() && self.hints.sent > self.hints.acked {
++                        let data = self.ping_tracker.new_ping_with_timeout(HINT_PONG);
++                        self.write_frame(RelayToClientMsg::Ping(data))
++                            .await
++                            .map_err(|err| e!(RunError::WriteFrame, err))?;
++                        self.hints.ping = Some((data, self.hints.sent.unwrap_or_default()));
++                    }
++                }
+                 _ = self.ping_tracker.timeout() => {
+                     trace!("pong timed out");
+                     break;
+@@ -516,6 +588,12 @@ where
+             }
+             ClientToRelayMsg::Pong(data) => {
+                 self.ping_tracker.pong_received(data);
++                // pushir: the frames handed over before that ping have arrived.
++                if let Some((_, n)) = self.hints.ping.take_if(|p| p.0 == data) {
++                    self.hints.acked = Some(n);
++                    self.clients.delivered(self.guard.endpoint_id(), n);
++                    self.hints.wake.notify_one();
++                }
+             }
+         }
+         Ok(())
+@@ -650,6 +728,7 @@ mod tests {
+             protocol_version: ProtocolVersion::V2,
+             rate_limited: None,
+             metrics,
++            hints: Default::default(),
+         };
+ 
+         let done = CancellationToken::new();
+diff --git a/src/server/clients.rs b/src/server/clients.rs
+index 13a9d90..46a0bf8 100644
+--- a/src/server/clients.rs
++++ b/src/server/clients.rs
+@@ -1,7 +1,14 @@
+ //! The "Server" side of the client. Uses the `ClientConnManager`.
+ // Based on tailscale/derp/derp_server.go
+ 
+-use std::{collections::HashSet, sync::Arc};
++use std::{
++    collections::{HashSet, VecDeque},
++    sync::{
++        Arc,
++        atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
++    },
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
++};
+ 
+ use dashmap::DashMap;
+ use iroh_base::EndpointId;
+@@ -34,6 +41,26 @@ struct Inner {
+     clients: DashMap<EndpointId, ClientState>,
+     /// Map of which client has sent where
+     sent_to: DashMap<EndpointId, HashSet<EndpointId>>,
++    /// pushir: each mailbox's frames, kept until it pongs a ping sent after them.
++    held: DashMap<EndpointId, VecDeque<Held>>,
++    /// Frames held in all, the next one's number, when the stale were last swept.
++    held_n: AtomicUsize,
++    held_seq: AtomicU64,
++    swept: AtomicU64,
++}
++
++/// A held frame: its number, when it came, from whom.
++type Held = (u64, Instant, EndpointId, Datagrams);
++
++/// Frames held per mailbox, in all, and for how long.
++const HOLD: (usize, usize, Duration) = (64, 1 << 16, Duration::from_secs(24 * 3600));
++
++/// A pushir frame: 1024 bytes marked congestion-experienced, which no QUIC
++/// sender sets, so iroh's traffic is never taken for one.
++fn hint(d: &Datagrams) -> bool {
++    d.ecn == Some(noq_proto::EcnCodepoint::Ce)
++        && d.segment_size.is_none()
++        && d.contents.len() == 1024
+ }
+ 
+ #[derive(Debug)]
+@@ -78,6 +105,7 @@ impl Clients {
+         trace!(remote_endpoint = %endpoint_id.fmt_short(), "registering client");
+ 
+         let client = Client::new(client_config, self, metrics.clone());
++        let hints = client.hints();
+         match self.0.clients.entry(endpoint_id) {
+             dashmap::Entry::Occupied(mut entry) => {
+                 let state = entry.get_mut();
+@@ -99,6 +127,8 @@ impl Clients {
+                 });
+             }
+         }
++        // pushir: now that frames find it, hand over what was held meanwhile.
++        hints.notify_one();
+     }
+ 
+     /// Removes the client from the map of clients, & sends a notification
+@@ -204,6 +234,10 @@ impl Clients {
+         src: EndpointId,
+         metrics: &Metrics,
+     ) -> Result<(), ForwardPacketError> {
++        if hint(&data) {
++            self.hold(dst, src, data);
++            return Ok(());
++        }
+         let Some(client) = self.0.clients.get(&dst) else {
+             debug!(dst = %dst.fmt_short(), "no connected client, dropped packet");
+             metrics.send_packets_dropped.inc();
+@@ -233,6 +267,95 @@ impl Clients {
+         }
+     }
+ 
++    /// pushir: keep `data` for `dst` and tell its connection, if it has one, which
++    /// hands it over and asks for a pong. A connected mailbox takes 64 at once
++    /// and one a second after (the rest is dropped); of a mailbox's own 64 the
++    /// oldest makes way; when all 65,536 are taken, a mailbox holding none is
++    /// handed the frame unkept, as a stock relay would.
++    fn hold(&self, dst: EndpointId, src: EndpointId, data: Datagrams) {
++        let client = self.0.clients.get(&dst);
++        if client.as_ref().is_some_and(|c| !c.active.hint_budget()) {
++            return;
++        }
++        if self.0.held_n.load(Relaxed) >= HOLD.1 {
++            self.sweep();
++        }
++        let full = self.0.held_n.load(Relaxed) >= HOLD.1;
++        let mut q = match self.0.held.entry(dst) {
++            dashmap::Entry::Occupied(e) => e.into_ref(),
++            dashmap::Entry::Vacant(_) if full => {
++                if let Some(c) = client {
++                    c.active.try_send_packet(src, data).ok();
++                }
++                return;
++            }
++            dashmap::Entry::Vacant(e) => e.insert(VecDeque::new()),
++        };
++        if (full || q.len() >= HOLD.0) && q.pop_front().is_some() {
++            self.0.held_n.fetch_sub(1, Relaxed);
++        }
++        q.push_back((
++            self.0.held_seq.fetch_add(1, Relaxed),
++            Instant::now(),
++            src,
++            data,
++        ));
++        self.0.held_n.fetch_add(1, Relaxed);
++        drop(q);
++        if let Some(c) = client {
++            c.active.wake_hints();
++        }
++    }
++
++    /// pushir: drop what was held past its day, at most once a minute, so frames
++    /// for mailboxes that never come back cannot fill the store for good.
++    fn sweep(&self) {
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map_or(0, |d| d.as_secs());
++        if self.0.swept.load(Relaxed) + 60 > now {
++            return;
++        }
++        self.0.swept.store(now, Relaxed);
++        self.0.held.retain(|_, q| {
++            while q.front().is_some_and(|h| h.1.elapsed() >= HOLD.2) {
++                q.pop_front();
++                self.0.held_n.fetch_sub(1, Relaxed);
++            }
++            !q.is_empty()
++        });
++    }
++
++    /// pushir: `dst`'s held frames past number `after`, the stale ones dropped.
++    pub(super) fn pending(
++        &self,
++        dst: EndpointId,
++        after: Option<u64>,
++    ) -> Vec<(u64, EndpointId, Datagrams)> {
++        let Some(mut q) = self.0.held.get_mut(&dst) else {
++            return Vec::new();
++        };
++        while q.front().is_some_and(|h| h.1.elapsed() >= HOLD.2) {
++            q.pop_front();
++            self.0.held_n.fetch_sub(1, Relaxed);
++        }
++        q.iter()
++            .filter(|h| Some(h.0) > after)
++            .map(|h| (h.0, h.2, h.3.clone()))
++            .collect()
++    }
++
++    /// pushir: `dst` ponged a ping sent after its frames up to number `upto`.
++    pub(super) fn delivered(&self, dst: EndpointId, upto: u64) {
++        if let Some(mut q) = self.0.held.get_mut(&dst) {
++            while q.front().is_some_and(|h| h.0 <= upto) {
++                q.pop_front();
++                self.0.held_n.fetch_sub(1, Relaxed);
++            }
++        }
++        self.0.held.remove_if(&dst, |_, q| q.is_empty());
++    }
++
+     #[cfg(test)]
+     fn active_connection_id(&self, endpoint_id: EndpointId) -> Option<ConnectionId> {
+         self.0

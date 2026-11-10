@@ -2,7 +2,8 @@
 # passes through untouched; each relay does its own Let's Encrypt). MSS clamped so every TCP segment fits WireGuard on a minimum-MTU (1280) path.
 # Abuse bounds live here, not in iroh-relay (its accept_conn_* limits are unimplemented in 1.4.1, and
 # behind the proxy it sees only 127.0.0.1): per source IP, nftables caps new connections and nginx
-# concurrent ones; idle sockets close after 135 min; iroh-relay caps each client's bytes.
+# concurrent ones; idle sockets close after 135 min; iroh-relay caps each client's bytes, and what it
+# holds for mailboxes (relay-hold.patch: 64 MiB at most); systemd caps its memory.
 self: { config, lib, pkgs, ... }:
 let
   cfg = config.services.irpushRelays;
@@ -95,6 +96,7 @@ in {
         WorkingDirectory = "/var/lib/irpush-relay";
         CapabilityBoundingSet = [ "" ];
         Environment = [ "RUST_LOG=warn" "RELAY_KEYS=/var/lib/irpush-relay/keys" ];
+        MemoryMax = "75%"; # a leak or a flood restarts the relay, not the host
         ExecStart = "${pkg.irpush-relay}/bin/iroh-relay --config-path ${pushConf}";
         LimitNOFILE = 16384;
       };
@@ -116,7 +118,7 @@ in {
           ssl_preread on;
           proxy_pass $relay;
           limit_conn perip 32; # phones of one household share an IP; a CGNAT'd crowd needs more
-          proxy_timeout 135m;  # > irpush's 2 h max heartbeat and the relay's 130 min ping: closes half-open sockets
+          proxy_timeout 135m;  # > pushir's 28 min longest heartbeat and the relay's 130 min ping: closes half-open sockets
         }
       '';
     };

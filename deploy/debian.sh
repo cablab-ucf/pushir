@@ -1,28 +1,37 @@
 #!/bin/sh
-# irpush's relay on Debian/Ubuntu, without Nix: no token, pings after 130 min,
-# post-quantum TLS, keys lift the rate limit, address discovery on UDP 7842.
-# As root: sh debian.sh irpush.example.org admin@example.org
+# pushir's relay on Debian/Ubuntu, without Nix: no token, pings after 130 min,
+# post-quantum TLS, keys lift the rate limit, frames kept until their mailbox
+# has them, address discovery on UDP 7842.
+# As root, from a checkout of this repository at a commit you trust:
+#   sh deploy/debian.sh irpush.example.org admin@example.org
 set -eu
 dom=${1:?usage: debian.sh DOMAIN EMAIL}
 mail=${2:?usage: debian.sh DOMAIN EMAIL}
 v=1.4.1
-src=/usr/local/src/irpush-relay
+sum=7e5589e7c1475700686603a970275687f760df853bc6525c7eb1347aa31d7230 # crates.io's checksum of iroh-relay $v
+here=$(cd "$(dirname "$0")" && pwd)
+src=/var/cache/irpush-relay
 
 apt-get update -q
-apt-get install -yq curl git build-essential pkg-config cmake patch
-[ -x "$HOME/.cargo/bin/cargo" ] ||
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
-PATH=$HOME/.cargo/bin:$PATH
+apt-get install -yq curl build-essential pkg-config cmake patch
 
-rm -rf "$src" && mkdir -p "$src"
-git clone -q --depth 1 https://github.com/cab-ucf/irpush "$src/irpush"
-curl -fsSL "https://static.crates.io/crates/iroh-relay/iroh-relay-$v.crate" |
-  tar xz -C "$src"
-cd "$src/iroh-relay-$v"
-cp ../irpush/deploy/iroh-relay.Cargo.lock Cargo.lock
-for p in ping pq unlimited; do patch -sp1 < "../irpush/deploy/relay-$p.patch"; done
-cargo build -q --release --locked --features server,tls-aws-lc-rs --bin iroh-relay
-install -m755 target/release/iroh-relay /usr/local/bin/irpush-relay
+# Built by a user of its own, not root: cargo runs every crate's build script.
+id irpush-build >/dev/null 2>&1 || useradd --system --home-dir "$src" --shell /usr/sbin/nologin irpush-build
+rm -rf "$src" && install -d -o irpush-build "$src"
+install -m644 "$here"/relay-*.patch "$here/iroh-relay.Cargo.lock" "$src"
+runuser -u irpush-build -- env HOME="$src" v=$v sum=$sum sh -eu <<'E'
+cd "$HOME"
+[ -x .cargo/bin/cargo ] ||
+  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+curl -fsSL -o relay.crate "https://static.crates.io/crates/iroh-relay/iroh-relay-$v.crate"
+echo "$sum  relay.crate" | sha256sum -c -
+tar xzf relay.crate
+cd "iroh-relay-$v"
+cp ../iroh-relay.Cargo.lock Cargo.lock
+for p in ping pq unlimited hold; do patch -sp1 < "../relay-$p.patch"; done
+"$HOME/.cargo/bin/cargo" build -q --release --locked --features server,tls-aws-lc-rs --bin iroh-relay
+E
+install -m755 "$src/iroh-relay-$v/target/release/iroh-relay" /usr/local/bin/irpush-relay
 
 umask 022   # the service's own user reads its config (no secrets in it)
 cat > /etc/irpush-relay.toml <<E
@@ -56,6 +65,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+MemoryMax=75%
 ExecStart=/usr/local/bin/irpush-relay --config-path /etc/irpush-relay.toml
 Restart=always
 LimitNOFILE=16384

@@ -1,67 +1,123 @@
-//! For android/irpush, in the app's own native library: the owner runs
-//! the mailbox; `next` hands it each frame as slot ‖ message.
+//! For android/pushir, in the app's own native library. The owner holds the
+//! mailbox and hands each frame on unopened (`next`, told its lane by
+//! `hears`); every app makes its own route key and opens its own frames.
 
 #![allow(unsafe_code)]
 
-use jni::JNIEnv;
-use jni::objects::{JClass, JString};
-use jni::sys::{jbyteArray, jstring};
+use jni::errors::{Error, Result, ThrowRuntimeExAndDefault as Throw};
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jboolean, jlong};
+use jni::{Env, EnvUnowned};
 use std::sync::{Mutex, OnceLock, mpsc};
 
 static RX: OnceLock<Mutex<mpsc::Receiver<Vec<u8>>>> = OnceLock::new();
-static ID: OnceLock<String> = OnceLock::new();
+/// The mailbox's id, or why it did not start: started once only.
+static ID: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+
+/// The mailbox, run on its own thread, with the key in `path`: its id.
+fn start(path: &std::path::Path) -> anyhow::Result<String> {
+    let sk = iroh_base::SecretKey::from_bytes(&crate::kept(path)?);
+    let relay = crate::relay()?;
+    // 64 frames wait for the owner's thread; more are a flood.
+    let (tx, rx) = mpsc::sync_channel(64);
+    let _ = RX.set(Mutex::new(rx));
+    let id = sk.public().to_string();
+    std::thread::spawn(move || {
+        let rt =
+            tokio::runtime::Builder::new_current_thread().enable_all().build();
+        let on = |f: &[u8]| drop(tx.try_send(f.to_vec()));
+        rt.expect("tokio").block_on(crate::listen(&relay, &sk, on))
+    });
+    Ok(id)
+}
+
+fn key(env: &Env, k: &JByteArray) -> Result<crate::Key> {
+    let k = env.convert_byte_array(k)?.try_into();
+    k.map_err(|_| Error::ParseFailed("a key is 32 bytes".into()))
+}
 
 /// Start the mailbox (once) with the key in `path`; its id.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_irpush_Native_start(
-    mut env: JNIEnv,
-    _: JClass,
-    path: JString,
-) -> jstring {
-    let path: String =
-        env.get_string(&path).map(Into::into).unwrap_or_default();
-    let id = ID.get_or_init(|| {
-        let p = std::path::Path::new(&path);
-        if !p.exists() {
-            let _ =
-                std::fs::write(p, iroh_base::SecretKey::generate().to_bytes());
-        }
-        let Some(b) =
-            std::fs::read(p).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())
-        else {
-            return String::new();
-        };
-        let sk = iroh_base::SecretKey::from_bytes(&b);
-        let (tx, rx) = mpsc::channel();
-        let _ = RX.set(Mutex::new(rx));
-        let id = sk.public().to_string();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio");
-            let on =
-                |s: crate::Slot, m: &[u8]| drop(tx.send([&s[..], m].concat()));
-            rt.block_on(crate::listen(
-                &crate::relay(),
-                &sk,
-                std::time::Duration::from_secs(600),
-                on,
-            ))
-        });
-        id
-    });
-    env.new_string(id).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+pub extern "system" fn Java_org_pushir_Native_start<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    path: JString<'l>,
+) -> JString<'l> {
+    env.with_env(|env: &mut Env<'l>| -> Result<_> {
+        let path = path.to_string();
+        let id = ID
+            .get_or_init(|| start(path.as_ref()).map_err(|e| format!("{e:#}")));
+        env.new_string(id.clone().map_err(Error::ParseFailed)?)
+    })
+    .resolve::<Throw>()
 }
 
-/// The next frame: blocks.
+/// The next frame, unopened; an empty one at each (re)connection. Blocks.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_irpush_Native_next(
-    env: JNIEnv,
-    _: JClass,
-) -> jbyteArray {
-    let m = RX
-        .get()
-        .and_then(|r| r.lock().unwrap().recv().ok())
-        .unwrap_or_default();
-    env.byte_array_from_slice(&m)
-        .map(|a| a.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+pub extern "system" fn Java_org_pushir_Native_next<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+) -> JByteArray<'l> {
+    env.with_env(|env: &mut Env<'l>| -> Result<_> {
+        let rx = RX.get().and_then(|rx| rx.lock().ok()?.recv().ok());
+        env.byte_array_from_slice(
+            &rx.ok_or(Error::ParseFailed("no mailbox".into()))?,
+        )
+    })
+    .resolve::<Throw>()
+}
+
+/// A lane's route key, from its secret: what the owner knows the lane by.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_pushir_Native_route<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    secret: JByteArray<'l>,
+) -> JByteArray<'l> {
+    env.with_env(|env: &mut Env<'l>| -> Result<_> {
+        let route = crate::route(&key(env, &secret)?);
+        env.byte_array_from_slice(&route)
+    })
+    .resolve::<Throw>()
+}
+
+/// Whether `frame` is for the lane of `route`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_pushir_Native_hears<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    route: JByteArray<'l>,
+    frame: JByteArray<'l>,
+) -> jboolean {
+    env.with_env(|env: &mut Env<'l>| -> Result<_> {
+        Ok(crate::hears(&key(env, &route)?, &env.convert_byte_array(&frame)?))
+    })
+    .resolve::<Throw>()
+}
+
+/// The message `frame` carries for the lane of `secret`; null if not its own.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_pushir_Native_open<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    secret: JByteArray<'l>,
+    frame: JByteArray<'l>,
+) -> JByteArray<'l> {
+    env.with_env(|env: &mut Env<'l>| -> Result<_> {
+        match crate::open(&key(env, &secret)?, &env.convert_byte_array(&frame)?)
+        {
+            Some(m) => env.byte_array_from_slice(&m),
+            None => Ok(JByteArray::null()),
+        }
+    })
+    .resolve::<Throw>()
+}
+
+/// Ping the relay now and wait for its answer: seconds until the next is due.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_pushir_Native_kick<'l>(
+    _: EnvUnowned<'l>,
+    _: JClass<'l>,
+) -> jlong {
+    crate::kick() as jlong
 }
