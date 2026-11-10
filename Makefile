@@ -1,0 +1,26 @@
+# Relay VPS (optional). Edit deploy/config.nix, point both DNS names at the VPS, then:
+#   make deploy HOST=1.2.3.4   # first time: installs NixOS over a fresh Ubuntu/Debian VPS (wipes it)
+#   make update HOST=...       # apply config changes
+#   make key HOST=...          # a new key that lifts the relay's rate limit (`make keys`: all of them)
+HOST ?=
+SSH := ssh root@$(HOST)
+
+build:
+	cargo build --release
+
+deploy:
+	nix run github:nix-community/nixos-anywhere -- --build-on remote --flake .#relay root@$(HOST)
+
+update:
+	nix run nixpkgs#nixos-rebuild -- switch --flake .#relay --target-host root@$(HOST) --build-host root@$(HOST)
+
+key:
+	$(SSH) 'umask 077; d=/var/lib/private/irpush-relay; openssl rand -hex 32 >> $$d/keys && chown --reference=$$d $$d/keys && tail -1 $$d/keys'
+
+keys:
+	$(SSH) cat /var/lib/private/irpush-relay/keys
+
+bump:
+	nix flake update
+
+.PHONY: build deploy update key keys bump

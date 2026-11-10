@@ -1,0 +1,33 @@
+[package]
+name = "irpush"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+description = "A relay mailbox that hands on sealed bytes, unopened"
+
+[dependencies]
+anyhow = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+iroh-base = "1.4.1"
+iroh-dns = "1.4.1"
+iroh-relay = { version = "1.4.1", default-features = false, features = ["tls-aws-lc-rs"] }
+irnet = { git = "https://github.com/cab-ucf/irnet", rev = "243b202a6d294406bd4c0ac4e336c20cd9e9940f" }
+data-encoding = "2"
+jni = { version = "0.21", optional = true }
+rand = "0.9"
+url = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+
+[features]
+jni = ["dep:jni"] # android/irpush: on in the app's native library
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+iroh-relay = { version = "1.4.1", default-features = false, features = ["platform-verifier"] }
+
+[dev-dependencies]
+iroh-relay = { version = "1.4.1", default-features = false, features = ["server", "tls-aws-lc-rs"] }
+
+[profile.release]
+lto = true
+strip = true

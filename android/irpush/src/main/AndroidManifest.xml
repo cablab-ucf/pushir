@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Apps of one group (manifestPlaceholders["irpushGroup"]), signed by one
+     key, share one connection: the one installed first owns it. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <permission android:name="${irpushGroup}.permission.IRPUSH" android:protectionLevel="signature" />
+    <uses-permission android:name="${irpushGroup}.permission.IRPUSH" />
+    <queries><intent><action android:name="org.irpush.ATTACH" /></intent></queries>
+    <application>
+        <service
+            android:name="org.irpush.Broker"
+            android:exported="true"
+            android:permission="${irpushGroup}.permission.IRPUSH"
+            android:foregroundServiceType="remoteMessaging">
+            <intent-filter><action android:name="org.irpush.ATTACH" /></intent-filter>
+        </service>
+        <receiver
+            android:name="org.irpush.Wake"
+            android:exported="true"
+            android:permission="${irpushGroup}.permission.IRPUSH">
+            <intent-filter><action android:name="org.irpush.WAKE" /></intent-filter>
+        </receiver>
+        <receiver android:name="org.irpush.Boot" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
