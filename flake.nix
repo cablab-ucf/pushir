@@ -28,7 +28,7 @@
         default = self.packages.${system}.pushir;
         pushir = pkgs.rustPlatform.buildRustPackage {
           pname = "pushir";
-          version = "0.3.0";
+          version = "0.4.0";
           src = fs.toSource { root = ./.; fileset = fs.unions [ ./Cargo.toml ./Cargo.lock ./src ]; };
           cargoLock = { lockFile = ./Cargo.lock; allowBuiltinFetchGit = true; }; # irnet, by its commit
           doCheck = false;
