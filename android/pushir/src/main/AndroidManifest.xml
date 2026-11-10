@@ -1,33 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Apps of one group (manifestPlaceholders["irpushGroup"]), signed by one
+<!-- Apps of one group (manifestPlaceholders["pushirGroup"]), signed by one
      key, share one connection: the one installed first owns it. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <permission android:name="${irpushGroup}.permission.IRPUSH" android:protectionLevel="signature" />
-    <uses-permission android:name="${irpushGroup}.permission.IRPUSH" />
-    <queries><intent><action android:name="org.irpush.ATTACH" /></intent></queries>
+    <permission android:name="${pushirGroup}.permission.PUSHIR" android:protectionLevel="signature" />
+    <uses-permission android:name="${pushirGroup}.permission.PUSHIR" />
+    <queries><intent><action android:name="org.pushir.ATTACH" /></intent></queries>
     <application>
         <service
-            android:name="org.irpush.Broker"
+            android:name="org.pushir.Broker"
             android:exported="true"
-            android:permission="${irpushGroup}.permission.IRPUSH"
+            android:permission="${pushirGroup}.permission.PUSHIR"
             android:foregroundServiceType="remoteMessaging">
-            <intent-filter><action android:name="org.irpush.ATTACH" /></intent-filter>
+            <intent-filter><action android:name="org.pushir.ATTACH" /></intent-filter>
         </service>
         <receiver
-            android:name="org.irpush.Wake"
+            android:name="org.pushir.Wake"
             android:exported="true"
-            android:permission="${irpushGroup}.permission.IRPUSH">
-            <intent-filter><action android:name="org.irpush.WAKE" /></intent-filter>
+            android:permission="${pushirGroup}.permission.PUSHIR">
+            <intent-filter><action android:name="org.pushir.WAKE" /></intent-filter>
         </receiver>
-        <receiver android:name="org.irpush.Boot" android:exported="false">
+        <receiver android:name="org.pushir.Boot" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+        <receiver android:name="org.pushir.Beat" android:exported="false" />
     </application>
 </manifest>

@@ -1,4 +1,4 @@
-// Standalone build (CI); apps include :irpush with their own plugin versions.
+// Standalone build (CI); apps include :pushir with their own plugin versions.
 plugins {
     id("com.android.library") version "8.7.3" apply false
     id("org.jetbrains.kotlin.android") version "2.0.21" apply false

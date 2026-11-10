@@ -4,5 +4,5 @@ pluginManagement {
 dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
-rootProject.name = "irpush-android"
-include(":irpush")
+rootProject.name = "pushir-android"
+include(":pushir")

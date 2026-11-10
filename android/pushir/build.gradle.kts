@@ -1,12 +1,12 @@
-// Kotlin only: the app links the irpush crate (feature `jni`) into its own
-// native library and names it in Irpush.start.
+// Kotlin only: the app links the pushir crate (feature `jni`) into its own
+// native library and names it in Pushir.start.
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
 }
 
 android {
-    namespace = "org.irpush"
+    namespace = "org.pushir"
     compileSdk = 35
     defaultConfig { minSdk = 26 }
     compileOptions {

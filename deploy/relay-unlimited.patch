@@ -43,17 +43,18 @@
          let limited_watcher = io.limited_watcher();
  
          // Create a server builder with default config
-@@ -1809,3 +1815,11 @@
+@@ -1809,3 +1815,12 @@
          Ok(())
      }
  }
 +
-+/// irpush: whether the client's bearer key is one of `$RELAY_KEYS`'s lines.
++/// irpush: whether the client's bearer key is one of `$RELAY_KEYS`'s lines (compared in constant time).
 +pub(crate) fn unlimited(h: &http::HeaderMap) -> bool {
 +    let Some(path) = std::env::var_os("RELAY_KEYS") else { return false };
 +    let Some(key) = h.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false };
 +    let Some(key) = key.strip_prefix("Bearer ").filter(|k| k.len() >= 32) else { return false };
-+    std::fs::read_to_string(path).is_ok_and(|f| f.lines().any(|l| l.trim() == key))
++    let same = |l: &str| l.len() == key.len() && l.bytes().zip(key.bytes()).fold(0, |x, (a, b)| x | (a ^ b)) == 0;
++    std::fs::read_to_string(path).is_ok_and(|f| f.lines().any(|l| same(l.trim())))
 +}
 --- a/src/server/streams.rs
 +++ b/src/server/streams.rs

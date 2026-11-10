@@ -21,6 +21,7 @@ jobs:
       - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with: { tool: cargo-audit@0.22.2 }
       - run: cargo audit
+      - run: cargo audit -f deploy/iroh-relay.Cargo.lock # the relay's own lock
 
 
   android: # the Kotlin library compiles
@@ -31,5 +32,5 @@ jobs:
         with: { distribution: temurin, java-version: "17" }
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with: { packages: platform-tools }
-      - run: ./gradlew --no-daemon :irpush:assembleRelease
+      - run: ./gradlew --no-daemon :pushir:assembleRelease
         working-directory: android
