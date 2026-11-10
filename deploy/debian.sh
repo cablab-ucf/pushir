@@ -3,7 +3,7 @@
 # post-quantum TLS, keys lift the rate limit, frames kept until their mailbox
 # has them, address discovery on UDP 7842.
 # As root, from a checkout of this repository at a commit you trust:
-#   sh deploy/debian.sh irpush.example.org admin@example.org
+#   sh deploy/debian.sh pushir.example.org admin@example.org
 set -eu
 dom=${1:?usage: debian.sh DOMAIN EMAIL}
 mail=${2:?usage: debian.sh DOMAIN EMAIL}

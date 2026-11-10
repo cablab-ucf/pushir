@@ -1,4 +1,4 @@
-# The irpush relay, and optionally a stock iroh relay beside it, behind one :443 routed by SNI (TLS
+# pushir's relay, and optionally a stock iroh relay beside it, behind one :443 routed by SNI (TLS
 # passes through untouched; each relay does its own Let's Encrypt). MSS clamped so every TCP segment fits WireGuard on a minimum-MTU (1280) path.
 # Abuse bounds live here, not in iroh-relay (its accept_conn_* limits are unimplemented in 1.4.1, and
 # behind the proxy it sees only 127.0.0.1): per source IP, nftables caps new connections and nginx
@@ -64,7 +64,7 @@ let
   };
 in {
   options.services.irpushRelays = {
-    enable = lib.mkEnableOption "irpush relay (+ iroh relay)";
+    enable = lib.mkEnableOption "pushir relay (+ iroh relay)";
     irohDomain = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; }; # null: irpush only
     irpushDomain = lib.mkOption { type = lib.types.str; };
     email = lib.mkOption { type = lib.types.str; };
