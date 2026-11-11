@@ -96,9 +96,12 @@ pub fn kept(path: &Path) -> Result<Key> {
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
         std::io::Write::write_all(&mut o.open(&new)?, &k)?;
-        // Whole or not at all, and never over a key made meanwhile.
-        let _ = std::fs::hard_link(&new, path);
-        std::fs::remove_file(new)?;
+        // Whole or not at all, and never over a key made meanwhile. Android
+        // lets an app make no hard link: there the file is moved into place.
+        match std::fs::hard_link(&new, path) {
+            Err(_) if !path.exists() => std::fs::rename(&new, path)?,
+            _ => std::fs::remove_file(new)?,
+        }
     }
     std::fs::read(path)?.try_into().ok().context("not a key: 32 bytes")
 }
