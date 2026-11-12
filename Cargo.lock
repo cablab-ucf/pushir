@@ -1356,7 +1356,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 [[package]]
 name = "irnet"
 version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/irnet?rev=7a19e4aeac4b56365626feea68cddd17496a18dc#7a19e4aeac4b56365626feea68cddd17496a18dc"
+source = "git+https://github.com/cablab-ucf/irnet?rev=fbd691d1b6dd34d4d2c027b6875df3f11c918f66#fbd691d1b6dd34d4d2c027b6875df3f11c918f66"
 dependencies = [
  "iroh",
  "rustls",

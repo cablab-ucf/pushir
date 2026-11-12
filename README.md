@@ -62,6 +62,7 @@ The app links this crate (feature `jni`) into its native library.
 // app: implementation(project(":pushir")); manifestPlaceholders["pushirGroup"] = "com.example"
 Pushir.start(this, "mylib", secret, onId = { mailbox -> }) { message -> }
 Pushir.ask(activity)   // at setup, until false: the owner's battery exemption, then its notifications
+Pushir.stop(this) // this app leaves: unbound, its own broker stopped
 ```
 
 The owner knows each app's lane by its route key, wakes an app that is not
@@ -88,6 +89,9 @@ then `make update`) or Debian (`deploy/debian.sh`). Set `deploy/config.nix`.
 - `relay-hold`: keeps a pushir frame (marked ECN-CE, which no QUIC sender
   sets, so iroh's traffic is never touched) until its mailbox pongs it;
   hands a connected mailbox 64 at once, then one a second; 65,536 in all.
+
+It is an iroh relay still, and the one with post-quantum TLS: irnet homes
+every endpoint there first (then on iroh.cxn.center, then n0's).
 
 `make relay-test` runs every test against that relay. It keeps its deployed
 name, `irpush-relay` at `irpush.cxn.center`.
