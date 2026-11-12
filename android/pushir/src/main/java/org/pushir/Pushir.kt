@@ -1,5 +1,7 @@
 package org.pushir
 
+import android.Manifest.permission.POST_NOTIFICATIONS
+import android.app.Activity
 import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -15,6 +17,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -22,7 +25,9 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Message
 import android.os.Messenger
+import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -44,6 +49,9 @@ internal object Native {
 
 private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 private fun String.unhex() = chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+/** Whole or not at all. */
+private fun File.put(b: ByteArray) = runCatching { File("$path.new").apply { writeBytes(b) }.renameTo(this) }
 
 /** The group's app installed first: the same answer in every app. */
 internal fun owner(c: Context): ComponentName? {
@@ -87,7 +95,10 @@ object Pushir {
     private val me = Messenger(Handler(Looper.getMainLooper()) { m ->
         runCatching {
             when (m.what) {
-                ID -> m.data.getString("id")?.let(onId)
+                ID -> {
+                    m.data.getByteArray("key")?.let(::keep)
+                    m.data.getString("id")?.let(onId)
+                }
                 PUSH -> m.data.getByteArray("d")?.let { if (it.isEmpty()) it else Native.open(secret, it) }?.let(onPush)
             }
         }
@@ -104,6 +115,34 @@ object Pushir {
         override fun onServiceDisconnected(n: ComponentName) = Unit
         override fun onBindingDied(n: ComponentName) = rebind()
         override fun onNullBinding(n: ComponentName) = rebind()
+    }
+
+    /** The owner's mailbox key, kept: should this app become the owner (the
+     *  owner removed), it holds the same mailbox, and every lane stands. */
+    private fun keep(k: ByteArray) {
+        val f = File(app.filesDir, "pushir.key")
+        if (k.size == 32 && runCatching { f.readBytes() }.getOrNull()?.contentEquals(k) != true) f.put(k)
+    }
+
+    /**
+     * From an activity, when the user can be asked: one thing at a time, so
+     * call again once they answer. First that the owner be exempt from
+     * battery optimisation (vendors kill its service otherwise, and only an
+     * exempt app's alarm may restart it); then, in the owner, the
+     * notification permission (else its service shows in the drawer not at
+     * all). False when nothing is left to ask.
+     */
+    fun ask(a: Activity): Boolean {
+        val o = owner(a)?.packageName ?: return false
+        if (a.getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(o) == false) {
+            return runCatching {
+                a.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$o")))
+            }.isSuccess
+        }
+        if (o != a.packageName || Build.VERSION.SDK_INT < 33 ||
+            a.checkSelfPermission(POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return false
+        a.requestPermissions(arrayOf(POST_NOTIFICATIONS), 0)
+        return true
     }
 
     /** [lib]: the app's native library. [onId]: the mailbox id, for the lane the app gives its senders. */
@@ -153,6 +192,11 @@ class Broker : Service() {
     private val apps = HashMap<String, Messenger>()
     private val held = ArrayDeque<ByteArray>()
     private var id = ""
+    private var key: ByteArray? = null
+
+    /** Held frames survive the owner's restart: they wait on flash, sealed. */
+    private val heldFile get() = File(filesDir, "pushir.held")
+    private fun save() = heldFile.put(held.fold(ByteArray(0), ByteArray::plus))
 
     /** Each lane's route key (hex) and its app, kept to wake an app not running. */
     private val lanes get() = getSharedPreferences("pushir", MODE_PRIVATE)
@@ -167,8 +211,8 @@ class Broker : Service() {
             lanes.all.filterValues { it == pkg }.keys.forEach { apps.remove(it); e.remove(it) }
             e.putString(route.hex(), pkg).apply()
             apps[route.hex()] = to
-            tell(to, ID, Bundle().apply { putString("id", id) })
-            held.removeAll { Native.hears(route, it) && tell(to, PUSH, Bundle().apply { putByteArray("d", it) }) }
+            tell(to, ID, Bundle().apply { putString("id", id); putByteArray("key", key) })
+            if (held.removeAll { Native.hears(route, it) && tell(to, PUSH, Bundle().apply { putByteArray("d", it) }) }) save()
         }
         true
     })
@@ -185,12 +229,19 @@ class Broker : Service() {
         lane?.let { apps.remove(it.key) }
         held.addLast(f)
         while (held.size > 64) held.removeFirst()
+        save()
         (lane?.value as? String)?.let { sendBroadcast(Intent("org.pushir.WAKE").setPackage(it)) }
     }
 
     override fun onCreate() {
         super.onCreate()
-        id = Native.start(File(filesDir, "pushir.key").path)
+        val k = File(filesDir, "pushir.key")
+        id = Native.start(k.path)
+        key = runCatching { k.readBytes() }.getOrNull()
+        // Each held frame again: its app woken.
+        runCatching { heldFile.readBytes() }.getOrNull()?.let { b ->
+            for (i in 0 until b.size / 1024) deliver(b.copyOfRange(i * 1024, i * 1024 + 1024))
+        }
         thread(isDaemon = true) {
             while (true) {
                 val f = Native.next()
@@ -223,6 +274,7 @@ class Wake : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) = Unit
 }
 
+/** Boot, an update, or a package removed: perhaps the owner, and this app the next. */
 class Boot : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) = ownerStart(c)
 }

@@ -61,15 +61,20 @@ The app links this crate (feature `jni`) into its native library.
 // settings: include(":pushir"); project(":pushir").projectDir = file("pushir/android/pushir")
 // app: implementation(project(":pushir")); manifestPlaceholders["pushirGroup"] = "com.example"
 Pushir.start(this, "mylib", secret, onId = { mailbox -> }) { message -> }
+Pushir.ask(activity)   // at setup, until false: the owner's battery exemption, then its notifications
 Pushir.stop(this) // this app leaves: unbound, its own broker stopped
 ```
 
 The owner knows each app's lane by its route key, wakes an app that is not
-running, and keeps 64 frames for those. Timers sleep with a phone, so an
-alarm (`setAndAllowWhileIdle`) makes each ping, and a network coming up
-reconnects at once. Ask the user to exempt the owner from battery
-optimisation where a vendor kills foreground services. No iOS: it allows
-no such socket.
+running, and keeps 64 frames for those, on flash. Timers sleep with a
+phone, so an alarm (`setAndAllowWhileIdle`) makes each ping, and a network
+coming up reconnects at once. `ask` matters: a vendor kills the service of
+an app not exempt from battery optimisation, and only an exempt app's alarm
+may restart it. Every app of the group keeps the mailbox key (it opens no
+frame), so when the owner is removed the next holds the same mailbox and
+every lane stands. Its service runs with or without its notification: shown
+(collapsed, under "Silent") only once the owner may notify. No iOS: it
+allows no such socket.
 
 ## Relay
 
