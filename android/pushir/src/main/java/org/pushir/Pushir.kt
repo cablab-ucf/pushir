@@ -81,6 +81,8 @@ object Pushir {
     private var onId: (String) -> Unit = {}
     private var onPush: (ByteArray) -> Unit = {}
     private var bound = false
+    /** Left by [stop]: nothing binds again until [start]. */
+    private var left = false
 
     private val me = Messenger(Handler(Looper.getMainLooper()) { m ->
         runCatching {
@@ -111,16 +113,32 @@ object Pushir {
         this.secret = secret
         this.onId = onId
         this.onPush = onPush
+        left = false
         ownerStart(app)
         bind()
     }
 
+    /**
+     * This app leaves the connection: unbound, and its own broker stopped
+     * if it is the one that holds the connection, so this app holds no
+     * socket. Another app of the group keeps its own connection. [start]
+     * joins again.
+     */
+    fun stop(c: Context) = main.post {
+        left = true
+        if (bound) runCatching { app.unbindService(conn) }
+        bound = false
+        runCatching { c.applicationContext.stopService(Intent(c, Broker::class.java)) }
+    }
+
     private fun bind() = main.post {
+        if (left) return@post
         val o = owner(app) ?: return@post
         if (!bound) bound = app.bindService(Intent(ATTACH).setComponent(o), conn, Context.BIND_AUTO_CREATE)
     }
 
     private fun rebind() {
+        if (left) return
         runCatching { app.unbindService(conn) }
         bound = false
         ownerStart(app)

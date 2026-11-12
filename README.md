@@ -61,6 +61,7 @@ The app links this crate (feature `jni`) into its native library.
 // settings: include(":pushir"); project(":pushir").projectDir = file("pushir/android/pushir")
 // app: implementation(project(":pushir")); manifestPlaceholders["pushirGroup"] = "com.example"
 Pushir.start(this, "mylib", secret, onId = { mailbox -> }) { message -> }
+Pushir.stop(this) // this app leaves: unbound, its own broker stopped
 ```
 
 The owner knows each app's lane by its route key, wakes an app that is not
