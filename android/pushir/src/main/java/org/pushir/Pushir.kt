@@ -134,7 +134,7 @@ object Pushir {
      */
     fun ask(a: Activity): Boolean {
         val o = owner(a)?.packageName ?: return false
-        if (a.getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(o) == false) {
+        if (!exempt(a)) {
             return runCatching {
                 a.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$o")))
             }.isSuccess
@@ -143,6 +143,13 @@ object Pushir {
             a.checkSelfPermission(POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return false
         a.requestPermissions(arrayOf(POST_NOTIFICATIONS), 0)
         return true
+    }
+
+    /** The owner (perhaps another app of the group) is exempt from battery
+     *  optimisation, as [ask] asks first: for the app's settings to show. */
+    fun exempt(c: Context): Boolean {
+        val o = owner(c)?.packageName ?: return false
+        return c.getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(o) == true
     }
 
     /** [lib]: the app's native library. [onId]: the mailbox id, for the lane the app gives its senders. */

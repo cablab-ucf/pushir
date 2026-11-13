@@ -62,6 +62,7 @@ The app links this crate (feature `jni`) into its native library.
 // app: implementation(project(":pushir")); manifestPlaceholders["pushirGroup"] = "com.example"
 Pushir.start(this, "mylib", secret, onId = { mailbox -> }) { message -> }
 Pushir.ask(activity)   // at setup, until false: the owner's battery exemption, then its notifications
+Pushir.exempt(this)    // whether the owner is exempt, for the app's settings to show
 Pushir.stop(this) // this app leaves: unbound, its own broker stopped
 ```
 
