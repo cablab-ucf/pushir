@@ -135,14 +135,27 @@ object Pushir {
     fun ask(a: Activity): Boolean {
         val o = owner(a)?.packageName ?: return false
         if (!exempt(a)) {
-            return runCatching {
-                a.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$o")))
-            }.isSuccess
+            // Android asks this only for the app asking (for another, nothing
+            // shows): another owner is set in its own settings (Battery).
+            val (act, at) = when (o) {
+                a.packageName -> Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS to "package:$o"
+                else -> Settings.ACTION_APPLICATION_DETAILS_SETTINGS to "package:$o"
+            }
+            return runCatching { a.startActivity(Intent(act, Uri.parse(at))) }.isSuccess
         }
         if (o != a.packageName || Build.VERSION.SDK_INT < 33 ||
             a.checkSelfPermission(POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return false
         a.requestPermissions(arrayOf(POST_NOTIFICATIONS), 0)
         return true
+    }
+
+    /** The owner's name, if it is another app of the group (it holds the
+     *  phone's connection, so it too must not be stopped asleep). */
+    @Suppress("DEPRECATION")
+    fun holder(c: Context): String? {
+        val o = owner(c)?.packageName?.takeIf { it != c.packageName } ?: return null
+        val pm = c.packageManager
+        return runCatching { pm.getApplicationLabel(pm.getApplicationInfo(o, 0)).toString() }.getOrDefault(o)
     }
 
     /** The owner (perhaps another app of the group) is exempt from battery
