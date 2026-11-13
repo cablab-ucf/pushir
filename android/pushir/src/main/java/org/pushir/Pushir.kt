@@ -32,6 +32,7 @@ import java.io.File
 import kotlin.concurrent.thread
 
 private const val ATTACH = "org.pushir.ATTACH"
+private const val WAKE = "org.pushir.WAKE"
 private const val HELLO = 1
 private const val ID = 2
 private const val PUSH = 3
@@ -40,6 +41,7 @@ private val main = Handler(Looper.getMainLooper())
 /** The app's native library links the pushir crate with feature `jni`. */
 internal object Native {
     @JvmStatic external fun start(path: String): String
+    @JvmStatic external fun stop()
     @JvmStatic external fun next(): ByteArray
     @JvmStatic external fun route(secret: ByteArray): ByteArray
     @JvmStatic external fun hears(route: ByteArray, frame: ByteArray): Boolean
@@ -53,18 +55,45 @@ private fun String.unhex() = chunked(2).map { it.toInt(16).toByte() }.toByteArra
 /** Whole or not at all. */
 private fun File.put(b: ByteArray) = runCatching { File("$path.new").apply { writeBytes(b) }.renameTo(this) }
 
-/** The group's app installed first: the same answer in every app. */
+/**
+ * The group's owner, of its apps listening (a broker enabled: [Pushir.stop]
+ * disables it): one Android lets run asleep (exempt from battery
+ * optimisation) before one it may stop, then the first installed. The same
+ * answer in every app: one app not listening, or stopped asleep, holds
+ * nobody's connection.
+ */
 internal fun owner(c: Context): ComponentName? {
     val pm = c.packageManager
-    return pm.queryIntentServices(Intent(ATTACH), 0).map { it.serviceInfo }
-        .filter { pm.checkSignatures(c.packageName, it.packageName) == PackageManager.SIGNATURE_MATCH }
-        .minWithOrNull(compareBy({ pm.getPackageInfo(it.packageName, 0).firstInstallTime }, { it.packageName }))
+    val power = c.getSystemService(PowerManager::class.java)
+    return group(c).minWithOrNull(compareBy({ power?.isIgnoringBatteryOptimizations(it.packageName) != true },
+        { pm.getPackageInfo(it.packageName, 0).firstInstallTime }, { it.packageName }))
         ?.let { ComponentName(it.packageName, it.name) }
 }
 
-/** Not from the background on Android 12+: then the system's own restart of the service stands. */
-private fun ownerStart(c: Context) {
-    if (owner(c)?.packageName == c.packageName) runCatching { c.startForegroundService(Intent(c, Broker::class.java)) }
+/** The group's brokers enabled: its apps signed by this one's key. */
+private fun group(c: Context): List<ServiceInfo> {
+    val pm = c.packageManager
+    return pm.queryIntentServices(Intent(ATTACH), 0).map { it.serviceInfo }
+        .filter { pm.checkSignatures(c.packageName, it.packageName) == PackageManager.SIGNATURE_MATCH }
+}
+
+/** This app's broker started if this app is the owner, else stopped (it
+ *  lets the mailbox go once its clients follow the owner); whether it is.
+ *  Not started from the background on Android 12+, unless exempt: then the
+ *  system's own restart of the service stands. */
+private fun ownerStart(c: Context): Boolean {
+    val broker = Intent(c, Broker::class.java)
+    val mine = owner(c)?.packageName == c.packageName
+    runCatching { if (mine) c.startForegroundService(broker) else c.stopService(broker) }
+    return mine
+}
+
+/** This app's broker in the group's election, or out of it. */
+private fun elect(c: Context, on: Boolean) = runCatching {
+    val state = if (on) PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+        else PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+    c.packageManager.setComponentEnabledSetting(ComponentName(c, Broker::class.java),
+        state, PackageManager.DONT_KILL_APP)
 }
 
 /** Ping the relay now, and wake for the next ping when it says: timers sleep with the phone, alarms do not. */
@@ -89,6 +118,8 @@ object Pushir {
     private var onId: (String) -> Unit = {}
     private var onPush: (ByteArray) -> Unit = {}
     private var bound = false
+    // The broker bound: another, once the group elects again, is followed.
+    private var to: ComponentName? = null
     /** Left by [stop]: nothing binds again until [start]. */
     private var left = false
 
@@ -128,20 +159,16 @@ object Pushir {
      * From an activity, when the user can be asked: one thing at a time, so
      * call again once they answer. First that the owner be exempt from
      * battery optimisation (vendors kill its service otherwise, and only an
-     * exempt app's alarm may restart it); then, in the owner, the
-     * notification permission (else its service shows in the drawer not at
-     * all). False when nothing is left to ask.
+     * exempt app's alarm may restart it): this app, asked, as one exempt is
+     * elected before one that is not; then, in the owner, the notification
+     * permission (else its service shows in the drawer not at all). False
+     * when nothing is left to ask.
      */
     fun ask(a: Activity): Boolean {
         val o = owner(a)?.packageName ?: return false
         if (!exempt(a)) {
-            // Android asks this only for the app asking (for another, nothing
-            // shows): another owner is set in its own settings (Battery).
-            val (act, at) = when (o) {
-                a.packageName -> Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS to "package:$o"
-                else -> Settings.ACTION_APPLICATION_DETAILS_SETTINGS to "package:$o"
-            }
-            return runCatching { a.startActivity(Intent(act, Uri.parse(at))) }.isSuccess
+            val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${a.packageName}"))
+            return runCatching { a.startActivity(i) }.isSuccess
         }
         if (o != a.packageName || Build.VERSION.SDK_INT < 33 ||
             a.checkSelfPermission(POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return false
@@ -172,34 +199,46 @@ object Pushir {
         this.secret = secret
         this.onId = onId
         this.onPush = onPush
-        left = false
-        ownerStart(app)
+        // After a [stop] just before: it runs on the main thread too.
+        main.post {
+            left = false
+            elect(app, true)
+            ownerStart(app)
+        }
         bind()
     }
 
+    /** The owner as the group elects it now (an app's battery setting
+     *  changed, or one joined or left): bound to, if another than before. */
+    internal fun follow() {
+        main.post { if (bound && owner(app) != to) rebind() }
+    }
+
     /**
-     * This app leaves the connection: unbound, and its own broker stopped
-     * if it is the one that holds the connection, so this app holds no
-     * socket. Another app of the group keeps its own connection. [start]
-     * joins again.
+     * This app leaves the connection: unbound, its own broker stopped and
+     * out of the group's election, so this app holds no socket and the
+     * group's next app holds the connection. [start] joins again.
      */
     fun stop(c: Context) = main.post {
         left = true
         if (bound) runCatching { app.unbindService(conn) }
         bound = false
         runCatching { c.applicationContext.stopService(Intent(c, Broker::class.java)) }
+        elect(c.applicationContext, false)
     }
 
     private fun bind() = main.post {
         if (left) return@post
         val o = owner(app) ?: return@post
         if (!bound) bound = app.bindService(Intent(ATTACH).setComponent(o), conn, Context.BIND_AUTO_CREATE)
+        if (bound) to = o
     }
 
     private fun rebind() {
         if (left) return
         runCatching { app.unbindService(conn) }
         bound = false
+        to = null
         ownerStart(app)
         main.postDelayed({ bind() }, 1000)
     }
@@ -250,7 +289,7 @@ class Broker : Service() {
         held.addLast(f)
         while (held.size > 64) held.removeFirst()
         save()
-        (lane?.value as? String)?.let { sendBroadcast(Intent("org.pushir.WAKE").setPackage(it)) }
+        (lane?.value as? String)?.let { sendBroadcast(Intent(WAKE).setPackage(it)) }
     }
 
     override fun onCreate() {
@@ -258,22 +297,42 @@ class Broker : Service() {
         val k = File(filesDir, "pushir.key")
         id = Native.start(k.path)
         key = runCatching { k.readBytes() }.getOrNull()
+        live = this
+        reader
         // Each held frame again: its app woken.
         runCatching { heldFile.readBytes() }.getOrNull()?.let { b ->
             for (i in 0 until b.size / 1024) deliver(b.copyOfRange(i * 1024, i * 1024 + 1024))
         }
-        thread(isDaemon = true) {
-            while (true) {
-                val f = Native.next()
-                main.post { deliver(f) }
-            }
-        }
         // Set the alarm; and at each network that comes up, reconnect at once.
         thread { beat(this) }
-        getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(
-            object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(n: Network) { thread { beat(this@Broker) } }
-            })
+        getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(net)
+        // The group elects again: an owner displaced stops, every app follows.
+        group(this).forEach { if (it.packageName != packageName) sendBroadcast(Intent(WAKE).setPackage(it.packageName)) }
+    }
+
+    private val net = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(n: Network) { thread { beat(this@Broker) } }
+    }
+
+    /** The mailbox let go with its broker: the next owner holds it alone. */
+    override fun onDestroy() {
+        Native.stop()
+        live = null
+        runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(net) }
+        super.onDestroy()
+    }
+
+    companion object {
+        /** The broker that runs: frames, read on one thread for the process, go to it. */
+        private var live: Broker? = null
+        private val reader by lazy {
+            thread(isDaemon = true) {
+                while (true) {
+                    val f = Native.next()
+                    main.post { live?.deliver(f) }
+                }
+            }
+        }
     }
 
     override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
@@ -289,20 +348,28 @@ class Broker : Service() {
     override fun onBind(i: Intent?): IBinder = inbox.binder
 }
 
-/** A frame waits for this app: starting its process is enough. */
+/** A frame waits for this app (starting its process is enough), or a
+ *  broker started: perhaps another owner, to follow. */
 class Wake : BroadcastReceiver() {
-    override fun onReceive(c: Context, i: Intent) = Unit
+    override fun onReceive(c: Context, i: Intent) {
+        ownerStart(c)
+        Pushir.follow()
+    }
 }
 
 /** Boot, an update, or a package removed: perhaps the owner, and this app the next. */
 class Boot : BroadcastReceiver() {
-    override fun onReceive(c: Context, i: Intent) = ownerStart(c)
-}
-
-/** The alarm: the phone stays awake for the ping's answer, no longer. */
-class Beat : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         ownerStart(c)
+    }
+}
+
+/** The alarm: the phone stays awake for the ping's answer, no longer. An
+ *  owner elected out (another app exempt since) stops, pings no more, and
+ *  follows the new one: its clients follow at that one's start. */
+class Beat : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        if (!ownerStart(c)) return Pushir.follow()
         val done = goAsync()
         thread { beat(c); done.finish() }
     }
