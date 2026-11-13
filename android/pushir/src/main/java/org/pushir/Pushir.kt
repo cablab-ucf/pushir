@@ -176,15 +176,6 @@ object Pushir {
         return true
     }
 
-    /** The owner's name, if it is another app of the group (it holds the
-     *  phone's connection, so it too must not be stopped asleep). */
-    @Suppress("DEPRECATION")
-    fun holder(c: Context): String? {
-        val o = owner(c)?.packageName?.takeIf { it != c.packageName } ?: return null
-        val pm = c.packageManager
-        return runCatching { pm.getApplicationLabel(pm.getApplicationInfo(o, 0)).toString() }.getOrDefault(o)
-    }
-
     /** The owner (perhaps another app of the group) is exempt from battery
      *  optimisation, as [ask] asks first: for the app's settings to show. */
     fun exempt(c: Context): Boolean {
