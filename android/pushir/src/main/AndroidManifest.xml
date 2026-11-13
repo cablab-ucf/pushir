@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Apps of one group (manifestPlaceholders["pushirGroup"]), signed by one
-     key, share one connection: the one installed first owns it. -->
+     key, share one connection: of those listening, one exempt from battery
+     optimisation, then the first installed, owns it. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

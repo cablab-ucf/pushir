@@ -54,16 +54,17 @@ pushir send LANE < m     # PUSHIR_RELAY (default irpush.cxn.center), PUSHIR_SOCK
 ## Android
 
 `android/pushir`: apps of one group (same signing key) share one
-connection; the one installed first owns it and runs a foreground service.
+connection; of those listening, one exempt from battery optimisation (else
+the first installed) owns it and runs a foreground service.
 The app links this crate (feature `jni`) into its native library.
 
 ```kotlin
 // settings: include(":pushir"); project(":pushir").projectDir = file("pushir/android/pushir")
 // app: implementation(project(":pushir")); manifestPlaceholders["pushirGroup"] = "com.example"
 Pushir.start(this, "mylib", secret, onId = { mailbox -> }) { message -> }
-Pushir.ask(activity)   // at setup, until false: the owner's battery exemption, then its notifications
+Pushir.ask(activity)   // at setup, until false: this app's battery exemption (it is elected), then the owner's notifications
 Pushir.exempt(this)    // whether the owner is exempt, for the app's settings to show
-Pushir.stop(this) // this app leaves: unbound, its own broker stopped
+Pushir.stop(this) // this app leaves: unbound, its broker stopped and out of the election
 ```
 
 The owner knows each app's lane by its route key, wakes an app that is not
@@ -72,8 +73,10 @@ phone, so an alarm (`setAndAllowWhileIdle`) makes each ping, and a network
 coming up reconnects at once. `ask` matters: a vendor kills the service of
 an app not exempt from battery optimisation, and only an exempt app's alarm
 may restart it. Every app of the group keeps the mailbox key (it opens no
-frame), so when the owner is removed the next holds the same mailbox and
-every lane stands. Its service runs with or without its notification: shown
+frame), so when the owner is removed, stops listening or is displaced (a
+broker that starts tells the group, which follows it), the next holds the
+same mailbox and every lane stands; an owner's mailbox is let go with its
+service, so two never contend for it. Its service runs with or without its notification: shown
 (collapsed, under "Silent") only once the owner may notify. No iOS: it
 allows no such socket.
 
