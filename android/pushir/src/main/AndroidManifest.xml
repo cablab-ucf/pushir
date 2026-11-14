@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Awake while a frame is taken: data wakes a phone for a moment only. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <application>
         <service
             android:name="org.pushir.Broker"

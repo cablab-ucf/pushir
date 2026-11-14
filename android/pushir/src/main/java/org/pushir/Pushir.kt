@@ -16,7 +16,9 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
@@ -35,6 +37,9 @@ private val main = Handler(Looper.getMainLooper())
  *  one app's `pushir.key` with the others; that one is left unused). */
 private const val KEY = "pushir.mailbox"
 
+/** How long a frame keeps the phone awake for its app. */
+private const val AWAKE = 30_000L
+
 /** The app's native library links the pushir crate with feature `jni`. */
 internal object Native {
     @JvmStatic external fun start(path: String): String
@@ -42,6 +47,7 @@ internal object Native {
     @JvmStatic external fun next(): ByteArray
     @JvmStatic external fun open(secret: ByteArray, frame: ByteArray): ByteArray?
     @JvmStatic external fun kick(): Long
+    @JvmStatic external fun moved(net: String)
 }
 
 /** Ping the relay now, and wake for the next ping when it says: timers sleep with the phone, alarms do not. */
@@ -114,7 +120,21 @@ object Pushir {
     internal fun frame(f: ByteArray) {
         if (!::secret.isInitialized) return
         val m = if (f.isEmpty()) f else Native.open(secret, f) ?: return
+        awake()
         main.post { runCatching { onPush(m) } }
+    }
+
+    private var lock: PowerManager.WakeLock? = null
+
+    /** Data wakes a sleeping phone for a moment only: awake [AWAKE] ms for
+     *  [onPush] to show what came, and for the relay's ping after it (else
+     *  it drops the connection). Only for a frame this app opens: a stranger
+     *  keeps no phone awake. */
+    private fun awake() = runCatching {
+        val l = lock ?: app.getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pushir:frame")
+            .apply { setReferenceCounted(false) }.also { lock = it }
+        l.acquire(AWAKE)
     }
 
     /**
@@ -144,8 +164,27 @@ object Pushir {
 /** Holds this app's mailbox while the app listens: the relay connection,
  *  its pings, and a reconnect at each network that comes up. */
 class Broker : Service() {
+    /** The default network and its addresses: another, or new ones there,
+     *  move the connection at once (no ping on the old). Each kind keeps
+     *  the silence its NAT allows, so a steady network is rarely pinged. */
+    private var at: Network? = null
+    private var addrs: Set<java.net.InetAddress> = emptySet()
     private val net = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(n: Network) { thread { beat(this@Broker) } }
+        override fun onLinkPropertiesChanged(n: Network, lp: LinkProperties) {
+            val a = lp.linkAddresses.map { it.address }.toSet()
+            if (n == at && a == addrs) return
+            at = n
+            addrs = a
+            val c = getSystemService(ConnectivityManager::class.java)?.getNetworkCapabilities(n)
+            val kind = when {
+                c == null -> "other"
+                c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cell"
+                c.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "eth"
+                else -> "other"
+            }
+            thread { runCatching { Native.moved(kind) }; beat(this@Broker) }
+        }
     }
 
     override fun onCreate() {
@@ -189,13 +228,16 @@ class Boot : BroadcastReceiver() {
     }
 }
 
-/** The alarm: the phone stays awake for the ping's answer, no longer. An
- *  app that no longer listens pings no more. */
+/** The alarm: the phone stays awake for the ping's answer, or for finding
+ *  the connection dead and making another (up to the kick's 30 s), no
+ *  longer. An app that no longer listens pings no more. */
 class Beat : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         if (!Pushir.on) return
         broker(c, true)
-        val done = goAsync()
-        thread { beat(c); done.finish() }
+        val lock = c.getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pushir:beat")
+        lock?.acquire(35_000)
+        thread { try { beat(c) } finally { if (lock?.isHeld == true) lock.release() } }
     }
 }

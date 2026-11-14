@@ -37,11 +37,13 @@ pushir send LANE < m     # PUSHIR_RELAY (default irpush.cxn.center), PUSHIR_SOCK
   for every app of the device: peers of two apps can tell they meet one
   device.
 - Battery: the connection is pinged after a silence that starts at 4 min
-  and grows by half with every answer, to 28 min (51 wakes a day: by
-  estimate, not yet measured, under 1 % of a phone's battery on mobile
-  data and far less on Wi-Fi); a ping left
-  unanswered means a NAT forgot the connection in that time, and the wait
-  closes in on that limit from below. Any frame resets the silence.
+  and grows by half with every answer, to 110 min (13 wakes a day, under
+  the relay's own 130 min ping); a ping left unanswered means a NAT forgot
+  the connection in that time, and the wait closes in on that limit from
+  below. Any frame resets the silence. None can be skipped: a NAT forgets
+  silently, and only the phone can find that out. Each kind of network
+  keeps what it allows (`moved`), and a move to another network, or a new
+  address, makes the connection anew at once, with no ping on the old.
 - TLS 1.3 to the relay with X25519MLKEM768 and nothing else (irnet's
   `pq`, the one post-quantum setup these crates share; pushir takes that
   alone, not irnet's endpoint): a relay without it is refused. `http` only
@@ -68,7 +70,10 @@ Pushir.stop(this)      // this app stops listening: its mailbox let go
 ```
 
 Timers sleep with a phone, so an alarm (`setAndAllowWhileIdle`) makes each
-ping, and a network coming up reconnects at once. `ask` matters: a vendor
+ping, awake until it is answered or the connection is made anew; a network
+coming up, or a connection lost, reconnects at once. Data wakes a phone for
+a moment only: a frame the app opens keeps it awake 30 s, for the app to
+show it and for the relay's ping that follows. `ask` matters: a vendor
 kills the service of an app not exempt from battery optimisation, and only
 an exempt app's alarm may restart it. The service runs with or without its
 notification: shown (collapsed, under "Silent") only once the app may
