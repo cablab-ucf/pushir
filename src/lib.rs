@@ -238,6 +238,9 @@ pub async fn send(to: &Lane, msg: &[u8]) -> Result<()> {
 const LO: Duration = Duration::from_secs(4 * 60);
 const HI: Duration = Duration::from_secs(28 * 60);
 const PONG: Duration = Duration::from_secs(15);
+/// How long a kick waits: past a pong's deadline and a reconnection, so a
+/// dead connection is found and replaced in the one wake.
+const KICKED: Duration = Duration::from_secs(30);
 
 /// How long the connection may stay silent before it is pinged. A ping
 /// wakes a phone's radio for some ten seconds, so the wait grows by half
@@ -297,17 +300,17 @@ fn pulse(wait: Duration) {
 }
 
 /// Ping the relay now, reconnecting if it does not answer, and wait up to
-/// 8 s for the answer: the seconds until this is next due. For a platform
-/// whose timers sleep with it (Android's alarm calls this) and for a
-/// network that just came back. Blocks: not for an async task.
+/// 30 s for the answer (or the reconnection): the seconds until this
+/// is next due. For a platform whose timers sleep with it (Android's alarm
+/// calls this, awake as long) and for a network that just came back.
+/// Blocks: not for an async task.
 pub fn kick() -> u64 {
     let p = PULSE.0.lock().unwrap_or_else(|e| e.into_inner());
     let n = p.0;
     // Whoever waits now, and the next to wait if none does.
     KICK.notify_waiters();
     KICK.notify_one();
-    let wait =
-        PULSE.1.wait_timeout_while(p, Duration::from_secs(8), |p| p.0 == n);
+    let wait = PULSE.1.wait_timeout_while(p, KICKED, |p| p.0 == n);
     let (p, late) = wait.unwrap_or_else(|e| e.into_inner());
     if late.timed_out() { 60 } else { p.1.as_secs() }
 }
@@ -319,14 +322,17 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
     let (mut beat, mut wait) = (Beat::new(), Duration::from_secs(1));
     loop {
         let at = Instant::now();
-        let _ = session(relay, sk, &on, &mut beat).await;
-        // A session that outlived the wait was a good one: start over.
-        let short = at.elapsed() < wait;
-        wait = if short {
-            (wait * 2).min(Duration::from_secs(300))
-        } else {
-            Duration::from_secs(1)
-        };
+        if let Ok(c) = connect(relay, sk.clone()).await {
+            let _ = session(c, &on, &mut beat).await;
+            // Connected a while, then lost: again at once. A timer sleeps
+            // with a phone, so waiting would hold what the relay keeps for
+            // us until something else wakes it.
+            if at.elapsed() >= wait {
+                wait = Duration::from_secs(1);
+                continue;
+            }
+        }
+        wait = (wait * 2).min(Duration::from_secs(300));
         tokio::select! {
             _ = sleep(wait) => {}
             _ = KICK.notified() => {}
@@ -335,12 +341,10 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
 }
 
 async fn session(
-    relay: &RelayUrl,
-    sk: &SecretKey,
+    mut c: Client,
     on: &impl Fn(&[u8]),
     beat: &mut Beat,
 ) -> Result<()> {
-    let mut c = connect(relay, sk.clone()).await?;
     on(&[]);
     pulse(beat.wait);
     // When the relay was last heard, by the clock that runs while the

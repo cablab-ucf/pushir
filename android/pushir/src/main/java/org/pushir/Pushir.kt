@@ -35,6 +35,9 @@ private val main = Handler(Looper.getMainLooper())
  *  one app's `pushir.key` with the others; that one is left unused). */
 private const val KEY = "pushir.mailbox"
 
+/** How long a frame keeps the phone awake for its app. */
+private const val AWAKE = 30_000L
+
 /** The app's native library links the pushir crate with feature `jni`. */
 internal object Native {
     @JvmStatic external fun start(path: String): String
@@ -114,7 +117,21 @@ object Pushir {
     internal fun frame(f: ByteArray) {
         if (!::secret.isInitialized) return
         val m = if (f.isEmpty()) f else Native.open(secret, f) ?: return
+        awake()
         main.post { runCatching { onPush(m) } }
+    }
+
+    private var lock: PowerManager.WakeLock? = null
+
+    /** Data wakes a sleeping phone for a moment only: awake [AWAKE] ms for
+     *  [onPush] to show what came, and for the relay's ping after it (else
+     *  it drops the connection). Only for a frame this app opens: a stranger
+     *  keeps no phone awake. */
+    private fun awake() = runCatching {
+        val l = lock ?: app.getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pushir:frame")
+            .apply { setReferenceCounted(false) }.also { lock = it }
+        l.acquire(AWAKE)
     }
 
     /**
@@ -189,13 +206,16 @@ class Boot : BroadcastReceiver() {
     }
 }
 
-/** The alarm: the phone stays awake for the ping's answer, no longer. An
- *  app that no longer listens pings no more. */
+/** The alarm: the phone stays awake for the ping's answer, or for finding
+ *  the connection dead and making another (up to the kick's 30 s), no
+ *  longer. An app that no longer listens pings no more. */
 class Beat : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         if (!Pushir.on) return
         broker(c, true)
-        val done = goAsync()
-        thread { beat(c); done.finish() }
+        val lock = c.getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pushir:beat")
+        lock?.acquire(35_000)
+        thread { try { beat(c) } finally { if (lock?.isHeld == true) lock.release() } }
     }
 }

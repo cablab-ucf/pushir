@@ -29,7 +29,7 @@ relay-test:
 	curl -fsSL https://static.crates.io/crates/iroh-relay/iroh-relay-1.4.1.crate | tar xz -C target/relay
 	cp deploy/iroh-relay.Cargo.lock target/relay/iroh-relay-1.4.1/Cargo.lock
 	for p in ping pq unlimited hold; do patch -sp1 -d target/relay/iroh-relay-1.4.1 < deploy/relay-$$p.patch || exit 1; done
-	cp -r Cargo.toml Cargo.lock src target/relay/pushir
+	cp -r Cargo.toml Cargo.lock src tests target/relay/pushir
 	cd target/relay/pushir && cargo test --config 'patch.crates-io.iroh-relay.path="../iroh-relay-1.4.1"' -- --include-ignored
 
 .PHONY: build deploy update key keys bump relay-test

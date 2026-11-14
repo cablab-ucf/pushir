@@ -68,7 +68,10 @@ Pushir.stop(this)      // this app stops listening: its mailbox let go
 ```
 
 Timers sleep with a phone, so an alarm (`setAndAllowWhileIdle`) makes each
-ping, and a network coming up reconnects at once. `ask` matters: a vendor
+ping, awake until it is answered or the connection is made anew; a network
+coming up, or a connection lost, reconnects at once. Data wakes a phone for
+a moment only: a frame the app opens keeps it awake 30 s, for the app to
+show it and for the relay's ping that follows. `ask` matters: a vendor
 kills the service of an app not exempt from battery optimisation, and only
 an exempt app's alarm may restart it. The service runs with or without its
 notification: shown (collapsed, under "Silent") only once the app may
