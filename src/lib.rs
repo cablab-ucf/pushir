@@ -445,6 +445,31 @@ mod tests {
         rx
     }
 
+    /// The wire as chatir v0.4.5 and later peers speak it (CLAUDE.md): a
+    /// frame sealed then opens and routes as it did, and a lane reads the
+    /// same. A change here strands every phone running an older one.
+    #[test]
+    fn the_wire_is_as_chatir_v0_4_5() {
+        let f = include_bytes!("../tests/v0.4.frame");
+        assert_eq!((FRAME, MAX), (1024, 966));
+        assert_eq!(open(&[3; 32], f).as_deref(), Some(&b"v0.4.5"[..]));
+        let r = route(&[3; 32]);
+        assert!(hears(&r, f));
+        let hex = data_encoding::HEXLOWER.encode(&r);
+        assert_eq!(
+            hex,
+            "0c2b23177a6648f4f239b3d6f608a78bdc5c5ead1ae2a673beb67104b1fa8c2f"
+        );
+        let id = SecretKey::from_bytes(&[5; 32]).public();
+        let l = Lane { relay: RELAY.parse().unwrap(), id, secret: [3; 32] };
+        let s = "pushir:6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1:\
+                 0303030303030303030303030303030303030303030303030303030303030303\
+                 @https://irpush.cxn.center./";
+        assert_eq!(l.to_string(), s);
+        assert!(s.parse::<Lane>().unwrap() == l);
+        assert_eq!(RELAY, "https://irpush.cxn.center./");
+    }
+
     #[test]
     fn a_frame_opens_for_its_lane_alone_and_tells_nothing() {
         let (a, b) = ([1; 32], [2; 32]);
