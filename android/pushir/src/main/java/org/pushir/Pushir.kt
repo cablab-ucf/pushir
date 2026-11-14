@@ -65,7 +65,7 @@ private fun beat(c: Context) {
 private fun broker(c: Context, on: Boolean) = runCatching {
     val i = Intent(c, Broker::class.java)
     if (on) c.startForegroundService(i) else c.stopService(i)
-}
+}.onFailure { Pushir.refused = "Android refused to start it (${it.javaClass.simpleName})" }
 
 /**
  * The app's own mailbox on a relay, held by its own foreground service:
@@ -84,6 +84,8 @@ object Pushir {
     /** Started, not stopped: this app listens (an alarm or boot of a
      *  process whose app does not listen starts nothing). */
     @Volatile internal var on = false
+    /** Why the mailbox is not held in the foreground, or null while it is. */
+    @Volatile internal var refused: String? = "Android has not started it"
 
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(n: ComponentName, b: IBinder) = Unit
@@ -105,6 +107,17 @@ object Pushir {
             app.bindService(Intent(app, Broker::class.java), conn, Context.BIND_AUTO_CREATE)
         }.getOrDefault(false)
     }
+
+    /** Start the service in the foreground now, from an activity in sight
+     *  (where Android always allows it): a start refused in the background,
+     *  at boot or from an alarm, is made good the moment the app is opened. */
+    fun hold(c: Context) {
+        if (on) broker(c.applicationContext, true)
+    }
+
+    /** Why this app's pushes cannot reach a sleeping phone now (its service
+     *  not held in the foreground, so Android freezes it), or null if they can. */
+    fun held(): String? = refused
 
     /** This app no longer listens: its mailbox let go, its service gone. [start] listens again. */
     fun stop(c: Context) {
@@ -197,6 +210,7 @@ class Broker : Service() {
 
     /** The mailbox let go with its service. */
     override fun onDestroy() {
+        Pushir.refused = "stopped"
         Native.stop()
         runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(net) }
         super.onDestroy()
@@ -209,6 +223,7 @@ class Broker : Service() {
             .setSmallIcon(android.R.drawable.stat_notify_sync).build()
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
         else startForeground(1, n)
+        Pushir.refused = null
         return START_STICKY
     }
 

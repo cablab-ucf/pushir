@@ -66,6 +66,8 @@ its native library.
 Pushir.start(this, "mylib", secret, onId = { mailbox -> }) { message -> }
 Pushir.ask(activity)   // at setup, until false: the battery exemption, then notifications
 Pushir.exempt(this)    // whether this app is exempt, for its settings to show
+Pushir.hold(activity)  // in onStart: the service started in sight, where Android allows it
+Pushir.held()          // null, or why a sleeping phone cannot be reached, for the app to say
 Pushir.stop(this)      // this app stops listening: its mailbox let go
 ```
 
