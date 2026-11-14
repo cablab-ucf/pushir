@@ -118,7 +118,7 @@ in {
           ssl_preread on;
           proxy_pass $relay;
           limit_conn perip 32; # phones of one household share an IP; a CGNAT'd crowd needs more
-          proxy_timeout 135m;  # > pushir's 28 min longest heartbeat and the relay's 130 min ping: closes half-open sockets
+          proxy_timeout 135m;  # > pushir's 110 min longest heartbeat and the relay's 130 min ping: closes half-open sockets
         }
       '';
     };

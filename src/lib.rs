@@ -21,7 +21,9 @@ use iroh_relay::client::{Client, ClientBuilder};
 use iroh_relay::protos::relay::{
     ClientToRelayMsg as Out, Datagrams, RelayToClientMsg as In,
 };
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
@@ -236,7 +238,8 @@ pub async fn send(to: &Lane, msg: &[u8]) -> Result<()> {
 /// The shortest and the longest silence before a ping, and how long its
 /// pong may take.
 const LO: Duration = Duration::from_secs(4 * 60);
-const HI: Duration = Duration::from_secs(28 * 60);
+/// Under the relay's own ping (130 min) and its proxy's idle close (135).
+const HI: Duration = Duration::from_secs(110 * 60);
 const PONG: Duration = Duration::from_secs(15);
 /// How long a kick waits: past a pong's deadline and a reconnection, so a
 /// dead connection is found and replaced in the one wake.
@@ -244,10 +247,11 @@ const KICKED: Duration = Duration::from_secs(30);
 
 /// How long the connection may stay silent before it is pinged. A ping
 /// wakes a phone's radio for some ten seconds, so the wait grows by half
-/// after every answered ping, to 28 min (51 a day: by estimate under 1 %
-/// of a battery on mobile data). A ping left unanswered means a NAT forgot
-/// the connection within that silence: the wait returns to the last one
-/// answered and closes in on the limit from below, by halves.
+/// after every answered ping, to 110 min (13 a day). A ping left
+/// unanswered means a NAT forgot the connection within that silence: the
+/// wait returns to the last one answered and closes in on the limit from
+/// below, by halves. Each network keeps what it was found to allow
+/// ([`moved`]), so a phone that comes back to one learns it once.
 struct Beat {
     wait: Duration,
     /// The longest silence a ping was answered after, if `wait` rests on one.
@@ -315,19 +319,41 @@ pub fn kick() -> u64 {
     if late.timed_out() { 60 } else { p.1.as_secs() }
 }
 
+/// The network the device is on, as its platform names it ("wifi",
+/// "cell"), and how often it moved: each move ends the connection.
+static NET: Mutex<String> = Mutex::new(String::new());
+static MOVES: AtomicU64 = AtomicU64::new(0);
+static MOVED: Notify = Notify::const_new();
+
+/// The device is on network `net` now, or its address changed there: the
+/// connection on the old one is dropped (no ping first) and one made on
+/// this at once. The first naming moves nothing.
+pub fn moved(net: &str) {
+    let mut n = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let first = n.is_empty();
+    *n = net.into();
+    if !first {
+        MOVES.fetch_add(1, SeqCst);
+        MOVED.notify_waiters();
+    }
+}
+
 /// Hold mailbox `sk` on `relay` and hand each frame to `on`, unopened; an
 /// empty one tells of a (re)connection, before which frames may have been
 /// missed. Reconnects forever.
 pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
-    let (mut beat, mut wait) = (Beat::new(), Duration::from_secs(1));
+    let mut beats: HashMap<String, Beat> = HashMap::new();
+    let mut wait = Duration::from_secs(1);
     loop {
-        let at = Instant::now();
+        let (at, moves) = (Instant::now(), MOVES.load(SeqCst));
         if let Ok(c) = connect(relay, sk.clone()).await {
-            let _ = session(c, &on, &mut beat).await;
-            // Connected a while, then lost: again at once. A timer sleeps
-            // with a phone, so waiting would hold what the relay keeps for
-            // us until something else wakes it.
-            if at.elapsed() >= wait {
+            let net = NET.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let beat = beats.entry(net).or_insert_with(Beat::new);
+            let _ = session(c, &on, beat, moves).await;
+            // Moved, or connected a while then lost: again at once. A
+            // timer sleeps with a phone, so waiting would hold what the
+            // relay keeps for us until something else wakes it.
+            if MOVES.load(SeqCst) != moves || at.elapsed() >= wait {
                 wait = Duration::from_secs(1);
                 continue;
             }
@@ -344,6 +370,7 @@ async fn session(
     mut c: Client,
     on: &impl Fn(&[u8]),
     beat: &mut Beat,
+    moves: u64,
 ) -> Result<()> {
     on(&[]);
     pulse(beat.wait);
@@ -353,6 +380,7 @@ async fn session(
     let mut ping: Option<([u8; 8], Duration, Instant)> = None;
     let run = async {
         loop {
+            ensure!(MOVES.load(SeqCst) == moves, "moved");
             let quiet = heard.elapsed().unwrap_or_default();
             // Timers stop while the device sleeps: look at the clock again
             // within a minute of waking.
@@ -381,6 +409,7 @@ async fn session(
                 },
                 _ = sleep_until(until) => {}
                 _ = KICK.notified() => kicked = true,
+                _ = MOVED.notified() => continue,
             }
             let quiet = heard.elapsed().unwrap_or_default();
             match ping {
@@ -398,11 +427,10 @@ async fn session(
         }
     };
     let end: Result<()> = run.await;
-    // Lost while a ping was out: the silence before it was too long. Lost
-    // otherwise (the network changed, the relay restarted): learn anew.
-    match ping {
-        Some((_, quiet, _)) => beat.unanswered(quiet),
-        None => *beat = Beat::new(),
+    // Lost while a ping was out, not moved: the silence before it was too
+    // long. Lost otherwise (moved, the relay restarted): nothing learnt.
+    if let Some((_, quiet, _)) = ping.filter(|_| MOVES.load(SeqCst) == moves) {
+        beat.unanswered(quiet);
     }
     end
 }
@@ -507,7 +535,7 @@ mod tests {
     fn the_beat_grows_and_settles_under_a_wait_that_failed() {
         let min = |m: u64| Duration::from_secs(m * 60);
         let mut b = Beat::new();
-        for _ in 0..8 {
+        for _ in 0..12 {
             b.answered(b.wait);
         }
         assert_eq!(b.wait, HI);

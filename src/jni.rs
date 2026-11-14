@@ -153,6 +153,17 @@ pub extern "system" fn Java_org_pushir_Native_kick<'l>(
     crate::kick() as jlong
 }
 
+/// The device is on network `net` (its kind: "wifi", "cell") or its address
+/// changed: the connection moves there at once.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_pushir_Native_moved<'l>(
+    _: EnvUnowned<'l>,
+    _: JClass<'l>,
+    net: JString<'l>,
+) {
+    crate::moved(&net.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

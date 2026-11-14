@@ -16,7 +16,9 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
@@ -45,6 +47,7 @@ internal object Native {
     @JvmStatic external fun next(): ByteArray
     @JvmStatic external fun open(secret: ByteArray, frame: ByteArray): ByteArray?
     @JvmStatic external fun kick(): Long
+    @JvmStatic external fun moved(net: String)
 }
 
 /** Ping the relay now, and wake for the next ping when it says: timers sleep with the phone, alarms do not. */
@@ -161,8 +164,27 @@ object Pushir {
 /** Holds this app's mailbox while the app listens: the relay connection,
  *  its pings, and a reconnect at each network that comes up. */
 class Broker : Service() {
+    /** The default network and its addresses: another, or new ones there,
+     *  move the connection at once (no ping on the old). Each kind keeps
+     *  the silence its NAT allows, so a steady network is rarely pinged. */
+    private var at: Network? = null
+    private var addrs: Set<java.net.InetAddress> = emptySet()
     private val net = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(n: Network) { thread { beat(this@Broker) } }
+        override fun onLinkPropertiesChanged(n: Network, lp: LinkProperties) {
+            val a = lp.linkAddresses.map { it.address }.toSet()
+            if (n == at && a == addrs) return
+            at = n
+            addrs = a
+            val c = getSystemService(ConnectivityManager::class.java)?.getNetworkCapabilities(n)
+            val kind = when {
+                c == null -> "other"
+                c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cell"
+                c.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "eth"
+                else -> "other"
+            }
+            thread { runCatching { Native.moved(kind) }; beat(this@Broker) }
+        }
     }
 
     override fun onCreate() {
