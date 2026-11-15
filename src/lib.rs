@@ -238,8 +238,9 @@ pub async fn send(to: &Lane, msg: &[u8]) -> Result<()> {
 /// The shortest and the longest silence before a ping, and how long its
 /// pong may take.
 const LO: Duration = Duration::from_secs(4 * 60);
-/// Under the relay's own ping (130 min) and its proxy's idle close (135).
-const HI: Duration = Duration::from_secs(110 * 60);
+/// Half an hour: a silent NAT drop costs at most this long before a ping
+/// finds it, and many NATs forget an idle connection not much later.
+const HI: Duration = Duration::from_secs(30 * 60);
 const PONG: Duration = Duration::from_secs(15);
 /// How long a kick waits: past a pong's deadline and a reconnection, so a
 /// dead connection is found and replaced in the one wake.
@@ -247,7 +248,7 @@ const KICKED: Duration = Duration::from_secs(30);
 
 /// How long the connection may stay silent before it is pinged. A ping
 /// wakes a phone's radio for some ten seconds, so the wait grows by half
-/// after every answered ping, to 110 min (13 a day). A ping left
+/// after every answered ping, to 30 min (48 a day). A ping left
 /// unanswered means a NAT forgot the connection within that silence: the
 /// wait returns to the last one answered and closes in on the limit from
 /// below, by halves. Each network keeps what it was found to allow
