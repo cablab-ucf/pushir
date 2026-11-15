@@ -37,8 +37,9 @@ pushir send LANE < m     # PUSHIR_RELAY (default irpush.cxn.center), PUSHIR_SOCK
   for every app of the device: peers of two apps can tell they meet one
   device.
 - Battery: the connection is pinged after a silence that starts at 4 min
-  and grows by half with every answer, to 110 min (13 wakes a day, under
-  the relay's own 130 min ping); a ping left unanswered means a NAT forgot
+  and grows by half with every answer, to 30 min (48 wakes a day: a
+  silent NAT drop is found within half an hour); a ping left unanswered
+  means a NAT forgot
   the connection in that time, and the wait closes in on that limit from
   below. Any frame resets the silence. None can be skipped: a NAT forgets
   silently, and only the phone can find that out. Each kind of network

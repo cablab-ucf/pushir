@@ -20,8 +20,9 @@
 - Timers sleep with a phone: pings come by alarm, a lost connection or a
   network move reconnects at once, and a frame the app opens or a ping
   out holds a wakelock. No ping can be skipped (a NAT forgets silently);
-  the longest silence stays under the relay's ping (130 min) and its
-  proxy's idle close (135 min).
+  the longest silence is 30 min (at 110 min, pushes waited an hour and
+  more where a NAT forgot sooner), under the relay's ping (130 min) and
+  its proxy's idle close (135 min).
 - Before changing `listen`, `session`, the Android service or the relay
   patches: `cargo test`, then `make relay-test` against the patched relay;
   then a phone, its app swiped away and locked, woken within seconds.
