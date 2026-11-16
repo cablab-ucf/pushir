@@ -21,7 +21,7 @@ use iroh_relay::client::{Client, ClientBuilder};
 use iroh_relay::protos::relay::{
     ClientToRelayMsg as Out, Datagrams, RelayToClientMsg as In,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Condvar, Mutex};
@@ -339,18 +339,65 @@ pub fn moved(net: &str) {
     }
 }
 
+/// The mailboxes this process holds, by id: how many [`listen`]s hold
+/// each, and how many of those are on its relay now.
+static HELD: Mutex<BTreeMap<[u8; 32], (u32, u32)>> =
+    Mutex::new(BTreeMap::new());
+
+/// One [`listen`]'s part in [`HELD`], given back as it ends or is dropped.
+struct Held([u8; 32], bool);
+
+impl Held {
+    fn tally(&self, held: i32, up: i32) {
+        let mut m = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.entry(self.0).or_default();
+        e.0 = e.0.saturating_add_signed(held);
+        e.1 = e.1.saturating_add_signed(up);
+        if e.0 == 0 {
+            m.remove(&self.0);
+        }
+    }
+
+    fn up(&mut self, up: bool) {
+        if self.1 != up {
+            self.tally(0, if up { 1 } else { -1 });
+            self.1 = up;
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.up(false);
+        self.tally(-1, 0);
+    }
+}
+
+/// Whether mailbox `id`, held by this process, is on its relay now (its
+/// last ping answered, or none yet due): what proves its lane between
+/// frames, at no cost. `None`: not held here (another process's, such as
+/// the daemon's).
+pub fn up(id: &PublicKey) -> Option<bool> {
+    let m = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    m.get(id.as_bytes()).map(|e| e.1 > 0)
+}
+
 /// Hold mailbox `sk` on `relay` and hand each frame to `on`, unopened; an
 /// empty one tells of a (re)connection, before which frames may have been
 /// missed. Reconnects forever.
 pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
     let mut beats: HashMap<String, Beat> = HashMap::new();
     let mut wait = Duration::from_secs(1);
+    let mut held = Held(*sk.public().as_bytes(), false);
+    held.tally(1, 0);
     loop {
         let (at, moves) = (Instant::now(), MOVES.load(SeqCst));
         if let Ok(c) = connect(relay, sk.clone()).await {
             let net = NET.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let beat = beats.entry(net).or_insert_with(Beat::new);
+            held.up(true);
             let _ = session(c, &on, beat, moves).await;
+            held.up(false);
             // Moved, or connected a while then lost: again at once. A
             // timer sleeps with a phone, so waiting would hold what the
             // relay keeps for us until something else wakes it.
@@ -640,6 +687,32 @@ mod tests {
             LO.as_secs(),
             "answered within 8 s; an early ping proves no longer wait"
         );
+    }
+
+    /// `up` says what this process holds: on its relay, off it, or gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn up_says_whether_the_mailbox_is_on_its_relay() {
+        let (s, r) = relay().await;
+        let sk = SecretKey::generate();
+        assert_eq!(up(&sk.public()), None, "not held here");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (r2, sk2) = (r.clone(), sk.clone());
+        let l = tokio::spawn(async move {
+            listen(&r2, &sk2, move |f| drop(tx.send(f.to_vec()))).await
+        });
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        assert_eq!(up(&sk.public()), Some(true));
+        s.shutdown().await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            while up(&sk.public()) != Some(false) {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("off its relay once that is gone");
+        l.abort();
+        let _ = l.await;
+        assert_eq!(up(&sk.public()), None, "let go");
     }
 
     /// With the lab's relay (`make relay-test`: deploy/relay-hold.patch): a
