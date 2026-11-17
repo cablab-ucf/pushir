@@ -13,7 +13,7 @@ mod jni;
 pub mod local;
 
 use anyhow::{Context, Result, bail, ensure};
-use aws_lc_rs::{aead, hmac, rand};
+use aws_lc_rs::{aead, constant_time::verify_slices_are_equal, hmac, rand};
 use data_encoding::HEXLOWER as HEX;
 use futures_util::{SinkExt, StreamExt};
 use iroh_base::{PublicKey, RelayUrl, SecretKey};
@@ -121,7 +121,12 @@ pub fn route(secret: &Key) -> Key {
 
 /// Whether `frame` is for the lane of `route`.
 pub fn hears(route: &Key, frame: &[u8]) -> bool {
-    frame.len() == FRAME && mac(route, &frame[..24])[..16] == frame[24..40]
+    frame.len() == FRAME
+        && verify_slices_are_equal(
+            &mac(route, &frame[..24])[..16],
+            &frame[24..40],
+        )
+        .is_ok()
 }
 
 /// A frame's own key, from the lane's and the frame's 24 random bytes: no
@@ -172,10 +177,19 @@ fn roots() -> iroh_relay::tls::CaTlsConfig {
     iroh_relay::tls::CaTlsConfig::embedded()
 }
 
+fn loopback(relay: &RelayUrl) -> bool {
+    match relay.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(name)) => {
+            matches!(name, "localhost" | "localhost.")
+        }
+        None => false,
+    }
+}
+
 async fn connect(relay: &RelayUrl, sk: SecretKey) -> Result<Client> {
-    let host = relay.host_str().unwrap_or_default();
-    let local =
-        host.starts_with("127.") || host == "localhost" || host == "[::1]";
+    let local = loopback(relay);
     ensure!(
         relay.scheme() == "https" || local,
         "{relay}: a relay is reached by https"
@@ -523,6 +537,22 @@ mod tests {
             listen(&r, &sk, move |f| drop(tx.send(f.to_vec()))).await
         });
         rx
+    }
+
+    #[test]
+    fn only_loopback_gets_the_local_relay_policy() {
+        for (host, local) in [
+            ("127.0.0.2", true),
+            ("[::1]", true),
+            ("localhost.", true),
+            ("127.office.example", false),
+            ("[::2]", false),
+        ] {
+            assert_eq!(
+                loopback(&format!("http://{host}/").parse().unwrap()),
+                local
+            );
+        }
     }
 
     /// The wire as chatir v0.4.5 and later peers speak it (CLAUDE.md): a
