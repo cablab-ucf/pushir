@@ -22,7 +22,7 @@ use iroh_relay::client::{Client, ClientBuilder};
 use iroh_relay::protos::relay::{
     ClientToRelayMsg as Out, Datagrams, RelayToClientMsg as In,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -470,6 +470,7 @@ pub fn up(id: &PublicKey) -> Option<bool> {
 /// missed. Reconnects forever.
 pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
     let mut beats: HashMap<String, Beat> = HashMap::new();
+    let mut seen = VecDeque::with_capacity(SEEN);
     let mut wait = Duration::from_secs(1);
     let mut held = Held(*sk.public().as_bytes(), false);
     held.tally(1, 0);
@@ -479,7 +480,7 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
             let net = NET.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let beat = beats.entry(net).or_insert_with(Beat::new);
             held.up(true);
-            let _ = session(c, &on, beat, moves).await;
+            let _ = session(c, &on, beat, &mut seen, moves).await;
             held.up(false);
             // Moved, or connected a while then lost: again at once. A
             // timer sleeps with a phone, so waiting would hold what the
@@ -500,10 +501,30 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
     }
 }
 
+/// How many frames' nonces a mailbox remembers, across reconnections.
+const SEEN: usize = 256;
+
+/// Whether the frame of `nonce` is none of the last [`SEEN`] handed on: one
+/// handed again (its connection lost before the pong, or replayed) goes on
+/// once. The empty frame of a (re)connection is ours, never the relay's,
+/// so never taken for one.
+fn fresh(seen: &mut VecDeque<[u8; 24]>, nonce: &[u8]) -> bool {
+    let n: [u8; 24] = nonce.try_into().expect("24 bytes");
+    if seen.contains(&n) {
+        return false;
+    }
+    if seen.len() == SEEN {
+        seen.pop_front();
+    }
+    seen.push_back(n);
+    true
+}
+
 async fn session(
     mut c: Client,
     on: &impl Fn(&[u8]),
     beat: &mut Beat,
+    seen: &mut VecDeque<[u8; 24]>,
     moves: u64,
 ) -> Result<()> {
     on(&[]);
@@ -527,8 +548,9 @@ async fn session(
                 m = c.next() => match m.context("closed")?? {
                     In::Datagrams { datagrams, .. } => {
                         heard = SystemTime::now();
-                        if datagrams.contents.len() == FRAME {
-                            on(&datagrams.contents);
+                        let f = &datagrams.contents;
+                        if f.len() == FRAME && fresh(seen, &f[..24]) {
+                            on(f);
                         }
                     }
                     In::Ping(d) => {
@@ -624,6 +646,38 @@ mod tests {
         let port = s.http_addr().unwrap().port();
         let r = format!("http://localhost:{port}/").parse().unwrap();
         connect(&r, SecretKey::generate()).await.unwrap();
+    }
+
+    /// A frame the relay hands again (its connection lost before the pong,
+    /// or replayed) is handed on once, within the last 256.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_handed_again_is_handed_on_once() {
+        let (_s, r) = relay().await;
+        let sk = SecretKey::generate();
+        let mut rx = mailbox(&r, &sk);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        let a = lane(&r, sk.public(), 1);
+        let (f, g) =
+            (seal(&a.secret, b"once").unwrap(), seal(&a.secret, b"next"));
+        let mut tx = Sender::connect(&r).await.unwrap();
+        for f in [&f, &f, &g.unwrap()] {
+            let mut d = Datagrams::from(f);
+            d.ecn = Some(noq_proto::EcnCodepoint::Ce);
+            let to = Out::Datagrams { dst_endpoint_id: a.id, datagrams: d };
+            tx.1.send(to).await.unwrap();
+        }
+        for m in [b"once", b"next"] {
+            let f = frame(&mut rx).await.unwrap();
+            assert_eq!(open(&a.secret, &f).unwrap(), m);
+        }
+        let mut seen = VecDeque::new();
+        assert!(fresh(&mut seen, &[0; 24]) && !fresh(&mut seen, &[0; 24]));
+        for i in 1..=SEEN as u16 {
+            let mut n = [0; 24];
+            n[..2].copy_from_slice(&i.to_be_bytes());
+            assert!(fresh(&mut seen, &n));
+        }
+        assert!(seen.len() == SEEN && fresh(&mut seen, &[0; 24]));
     }
 
     #[test]
