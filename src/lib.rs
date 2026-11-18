@@ -919,45 +919,112 @@ mod tests {
         assert!(more.await.is_err(), "handed over twice after its pong");
     }
 
-    /// With the lab's relay: a flood to one mailbox is cut to a burst of 64
-    /// and one a second after, and of what waits for a mailbox that is away
-    /// the newest 64 are kept.
+    /// The first byte of each message for `a`, until 2 s pass with none.
+    async fn heard(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        a: &Lane,
+    ) -> Vec<u8> {
+        let mut got = vec![];
+        while let Ok(Some(f)) = timeout(Duration::from_secs(2), rx.recv()).await
+        {
+            got.extend(open(&a.secret, &f).and_then(|m| m.first().copied()));
+        }
+        got
+    }
+
+    /// With the lab's relay: when the connection that holds a mailbox leaves,
+    /// the one before it is handed what is held at once.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_promoted_connection_is_handed_what_is_held() {
+        let (_s, r) = relay().await;
+        let sk = SecretKey::generate();
+        let a = lane(&r, sk.public(), 1);
+        let mut rx = mailbox(&r, &sk);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        // A second connection with its key takes over, takes the frame and
+        // leaves without a pong.
+        let mut c = connect(&r, sk.clone()).await.unwrap();
+        sleep(Duration::from_millis(500)).await;
+        send(&a, b"held").await.unwrap();
+        let got = loop {
+            if let In::Datagrams { datagrams, .. } =
+                c.next().await.unwrap().unwrap()
+            {
+                break datagrams.contents;
+            }
+        };
+        assert_eq!(open(&a.secret, &got).unwrap(), b"held");
+        let idle = timeout(Duration::from_secs(1), rx.recv()).await;
+        assert!(idle.is_err(), "the one put aside is handed nothing");
+        drop(c);
+        let f = frame(&mut rx).await.expect("handed it when promoted");
+        assert_eq!(open(&a.secret, &f).unwrap(), b"held");
+    }
+
+    /// With the lab's relay: with all 65,536 frames it keeps taken, the
+    /// oldest held anywhere makes way, so a new mailbox's frame is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_full_relay_lets_its_oldest_frame_go() {
+        let (_s, r) = relay().await;
+        let (x, y) = (SecretKey::generate(), SecretKey::generate());
+        let mut tx = Sender::connect(&r).await.unwrap();
+        tx.send(&lane(&r, x.public(), 1), b"oldest").await.unwrap();
+        for _ in 0..1024 {
+            let away = lane(&r, SecretKey::generate().public(), 2);
+            for _ in 0..64 {
+                tx.send(&away, b"").await.unwrap();
+            }
+        }
+        tx.send(&lane(&r, y.public(), 1), b"newest").await.unwrap();
+        tx.close().await.unwrap();
+        sleep(Duration::from_millis(500)).await;
+        let mut rx = mailbox(&r, &y);
+        let f = frame(&mut rx).await.expect("kept");
+        assert_eq!(open(&[1; 32], &f).unwrap(), b"newest");
+        let mut rx = mailbox(&r, &x);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        let none = timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(none.is_err(), "the oldest made way");
+    }
+
+    /// With the lab's relay: of what waits for a mailbox that is away the
+    /// newest 64 are kept; a connected one is handed a burst of 64 at once,
+    /// and of what comes past it the newest 64 a minute later, in one batch.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn the_relay_bounds_a_flood() {
         let (_s, r) = relay().await;
+        let flood = async |a: &Lane| {
+            let mut tx = Sender::connect(&r).await.unwrap();
+            for i in 0..200u8 {
+                tx.send(a, &[i]).await.unwrap();
+            }
+            tx.close().await.unwrap();
+        };
         let sk = SecretKey::generate();
         let a = lane(&r, sk.public(), 1);
-        let mut tx = Sender::connect(&r).await.unwrap();
-        for i in 0..100u8 {
-            tx.send(&a, &[i]).await.unwrap();
-        }
-        tx.close().await.unwrap();
+        flood(&a).await;
         sleep(Duration::from_millis(500)).await;
         let mut rx = mailbox(&r, &sk);
-        let mut got = vec![];
-        while let Ok(Some(f)) = timeout(Duration::from_secs(2), rx.recv()).await
-        {
-            got.extend(
-                open(&a.secret, &f).filter(|m| !m.is_empty()).map(|m| m[0]),
-            );
-        }
-        assert_eq!(
-            got,
-            (36..100).collect::<Vec<u8>>(),
-            "the newest 64, in order"
-        );
-        // Connected: 64 at once, then about one a second.
-        let mut tx = Sender::connect(&r).await.unwrap();
-        for i in 0..200u8 {
-            tx.send(&a, &[i]).await.unwrap();
-        }
-        tx.close().await.unwrap();
-        let mut n = 0;
-        while let Ok(Some(f)) = timeout(Duration::from_secs(2), rx.recv()).await
-        {
-            n += open(&a.secret, &f).is_some() as usize;
-        }
-        assert!((64..=70).contains(&n), "{n} of 200 passed");
+        let newest: Vec<u8> = (136..200).collect();
+        assert_eq!(heard(&mut rx, &a).await, newest, "the newest 64, in order");
+        // Connected: 64 at once (the newest as it is handed them), then
+        // nothing until the batch.
+        let sk = SecretKey::generate();
+        let a = lane(&r, sk.public(), 1);
+        let mut rx = mailbox(&r, &sk);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        flood(&a).await;
+        let burst = heard(&mut rx, &a).await;
+        assert_eq!(burst.len(), 64, "{burst:?}");
+        assert!(burst.is_sorted() && burst[63] < 136, "{burst:?}");
+        let t = Instant::now();
+        let f = timeout(Duration::from_secs(75), rx.recv()).await.unwrap();
+        assert!(t.elapsed() > Duration::from_secs(45), "a batch, no trickle");
+        let mut got = vec![open(&a.secret, &f.unwrap()).unwrap()[0]];
+        got.extend(heard(&mut rx, &a).await);
+        assert_eq!(got, newest, "the newest 64, in one batch");
     }
 }
