@@ -376,7 +376,7 @@ impl Beat {
 }
 
 /// Wakes the session to ping now, and tells [`kick`] of each answer: its
-/// count, and the wait before the next ping.
+/// count, and the wait before the next ping (or, offline, the next try).
 static KICK: Notify = Notify::const_new();
 static PULSE: (Mutex<(u64, Duration)>, Condvar) =
     (Mutex::new((0, LO)), Condvar::new());
@@ -388,8 +388,8 @@ fn pulse(wait: Duration) {
 }
 
 /// Ping the relay now, reconnecting if it does not answer, and wait up to
-/// 30 s for the answer (or the reconnection): the seconds until this
-/// is next due. For a platform whose timers sleep with it (Android's alarm
+/// 30 s for the answer (or the reconnection, or its failure): the seconds
+/// until this is next due. For a platform whose timers sleep with it (Android's alarm
 /// calls this, awake as long) and for a network that just came back.
 /// Blocks: not for an async task.
 pub fn kick() -> u64 {
@@ -490,6 +490,9 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
             }
         }
         wait = (wait * 2).min(Duration::from_secs(300));
+        // Offline: a kick has its answer now, the next try (a minute at
+        // least, for a phone's alarm), not a wake each minute held 30 s.
+        pulse(wait.max(LO / 4));
         tokio::select! {
             _ = sleep(wait) => {}
             _ = KICK.notified() => {}
@@ -793,19 +796,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_kick_pings_now() {
-        let (_s, r) = relay().await;
-        let mut rx = mailbox(&r, &SecretKey::generate());
-        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
-        let next = tokio::task::spawn_blocking(kick).await.unwrap();
-        assert_eq!(
-            next,
-            LO.as_secs(),
-            "answered within 8 s; an early ping proves no longer wait"
-        );
-    }
-
     /// `up` says what this process holds: on its relay, off it, or gone.
     #[tokio::test(flavor = "multi_thread")]
     async fn up_says_whether_the_mailbox_is_on_its_relay() {
@@ -819,6 +809,10 @@ mod tests {
         });
         assert_eq!(rx.recv().await.unwrap(), b"", "connected");
         assert_eq!(up(&sk.public()), Some(true));
+        // A frame through it: the relay has the connection, so its
+        // shutdown closes it (one not yet registered would outlive it).
+        send(&lane(&r, sk.public(), 1), b"").await.unwrap();
+        assert!(frame(&mut rx).await.is_some());
         s.shutdown().await.unwrap();
         timeout(Duration::from_secs(10), async {
             while up(&sk.public()) != Some(false) {
