@@ -2494,6 +2494,7 @@ dependencies = [
  "iroh-dns",
  "iroh-relay",
  "jni 0.22.4",
+ "n0-error",
  "noq-proto",
  "tokio",
  "url",

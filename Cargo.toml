@@ -16,6 +16,7 @@ iroh-base = "1.4.1"
 iroh-dns = "1.4.1"
 iroh-relay = { version = "1.4.1", default-features = false, features = ["tls-aws-lc-rs"] }
 jni = { version = "0.22", optional = true }
+n0-error = "1"
 noq-proto = { version = "1.4", default-features = false }
 # Its post-quantum TLS alone: no endpoint, no iroh.
 irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "7f8c000428461e8000657866620952d4dad247d5", default-features = false, features = ["aws-lc"] }

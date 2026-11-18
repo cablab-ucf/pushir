@@ -17,14 +17,16 @@ use aws_lc_rs::{aead, constant_time::verify_slices_are_equal, hmac, rand};
 use data_encoding::HEXLOWER as HEX;
 use futures_util::{SinkExt, StreamExt};
 use iroh_base::{PublicKey, RelayUrl, SecretKey};
+use iroh_dns::dns;
 use iroh_relay::client::{Client, ClientBuilder};
 use iroh_relay::protos::relay::{
     ClientToRelayMsg as Out, Datagrams, RelayToClientMsg as In,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
@@ -188,6 +190,65 @@ fn loopback(relay: &RelayUrl) -> bool {
     }
 }
 
+/// Names as the system resolves them (getaddrinfo), which honours each
+/// network's DNS and Android's Private DNS. iroh's own resolver reads
+/// Android's DNS servers through JNI and panics with no activity (a boot,
+/// an update): with `panic = "abort"` the process dies, pushes and all.
+#[derive(Debug)]
+struct System;
+
+type Found<T> = std::pin::Pin<
+    Box<
+        dyn Future<Output = Result<dns::BoxIter<T>, dns::DnsError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+impl System {
+    fn find<T: Send + 'static>(
+        host: String,
+        of: fn(IpAddr) -> Option<T>,
+    ) -> Found<T> {
+        Box::pin(async move {
+            let found = tokio::net::lookup_host((host, 0)).await;
+            let found = found.map_err(n0_error::AnyError::from)?;
+            let ips: Vec<T> = found.filter_map(|a| of(a.ip())).collect();
+            Ok(Box::new(ips.into_iter()) as dns::BoxIter<T>)
+        })
+    }
+}
+
+impl dns::Resolver for System {
+    fn lookup_ipv4(&self, host: String) -> Found<Ipv4Addr> {
+        Self::find(host, |ip| match ip {
+            IpAddr::V4(ip) => Some(ip),
+            _ => None,
+        })
+    }
+
+    fn lookup_ipv6(&self, host: String) -> Found<Ipv6Addr> {
+        Self::find(host, |ip| match ip {
+            IpAddr::V6(ip) => Some(ip),
+            _ => None,
+        })
+    }
+
+    fn lookup_txt(&self, _: String) -> Found<dns::TxtRecordData> {
+        Box::pin(async { Err(n0_error::AnyError::from("no TXT lookups"))? })
+    }
+
+    fn clear_cache(&self) {}
+
+    fn reset(&self) -> Box<dyn dns::Resolver> {
+        Box::new(System)
+    }
+}
+
+/// One for the process: it holds nothing but the system's.
+static DNS: LazyLock<dns::DnsResolver> =
+    LazyLock::new(|| dns::DnsResolver::custom(System));
+
 async fn connect(relay: &RelayUrl, sk: SecretKey) -> Result<Client> {
     let local = loopback(relay);
     ensure!(
@@ -197,11 +258,7 @@ async fn connect(relay: &RelayUrl, sk: SecretKey) -> Result<Client> {
     // irnet's hybrid alone: a relay without it is refused, not met
     // classically, for this hop hides who is sent to from a recording.
     let tls = roots().client_config(irnet::pq())?;
-    let b = ClientBuilder::new(
-        relay.clone(),
-        sk,
-        iroh_dns::dns::DnsResolver::new(),
-    );
+    let b = ClientBuilder::new(relay.clone(), sk, DNS.clone());
     // Through the network's proxy, if it has one.
     let proxy = ["HTTPS_PROXY", "https_proxy"]
         .iter()
@@ -538,6 +595,20 @@ mod tests {
             listen(&r, &sk, move |f| drop(tx.send(f.to_vec()))).await
         });
         rx
+    }
+
+    /// A relay's name is resolved by the system, no JNI asked (none can be
+    /// had on Android without an activity), and connected to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn names_resolve_as_the_system_does() {
+        let url = "http://localhost/".parse().unwrap();
+        let ips: Vec<_> =
+            DNS.resolve_host_all(&url, PONG).collect::<Vec<_>>().await;
+        assert!(ips.iter().flatten().any(IpAddr::is_loopback), "{ips:?}");
+        let (s, _) = relay().await;
+        let port = s.http_addr().unwrap().port();
+        let r = format!("http://localhost:{port}/").parse().unwrap();
+        connect(&r, SecretKey::generate()).await.unwrap();
     }
 
     #[test]
