@@ -78,13 +78,10 @@ impl std::str::FromStr for Lane {
             let (at, relay) = s.strip_prefix("pushir:")?.split_once('@')?;
             let (id, secret) = at.split_once(':')?;
             let secret = HEX.decode(secret.as_bytes()).ok()?.try_into().ok()?;
-            Some(Lane {
-                relay: relay.parse().ok()?,
-                id: id.parse().ok()?,
-                secret,
-            })
+            let relay = relay.parse().ok().filter(dialable)?;
+            Some(Lane { relay, id: id.parse().ok()?, secret })
         };
-        lane().context("not a lane: pushir:ID:SECRET@RELAY")
+        lane().context("not a lane: pushir:ID:SECRET@RELAY, RELAY by https")
     }
 }
 
@@ -179,14 +176,32 @@ fn roots() -> iroh_relay::tls::CaTlsConfig {
     iroh_relay::tls::CaTlsConfig::embedded()
 }
 
+/// Whether `relay` is this device itself (0.0.0.0 and ::ffff:127.0.0.1
+/// reach it too).
 fn loopback(relay: &RelayUrl) -> bool {
+    let me = |ip: IpAddr| ip.is_loopback() || ip.is_unspecified();
     match relay.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv4(ip)) => me(ip.into()),
+        Some(url::Host::Ipv6(ip)) => me(ip.to_canonical()),
         Some(url::Host::Domain(name)) => {
             matches!(name, "localhost" | "localhost.")
         }
         None => false,
+    }
+}
+
+/// Whether `relay` may be dialled: by https, with nothing but a host, port
+/// and path. Loopback (by http too) only while this device's own relay
+/// ([`relay`]) is loopback, a test's: a peer's lane reaches no local port.
+fn dialable(relay: &RelayUrl) -> bool {
+    let bare = relay.username().is_empty()
+        && relay.password().is_none()
+        && relay.query().is_none()
+        && relay.fragment().is_none();
+    let local = || cfg!(test) || crate::relay().is_ok_and(|r| loopback(&r));
+    bare && match loopback(relay) {
+        false => relay.scheme() == "https",
+        true => matches!(relay.scheme(), "http" | "https") && local(),
     }
 }
 
@@ -250,11 +265,8 @@ static DNS: LazyLock<dns::DnsResolver> =
     LazyLock::new(|| dns::DnsResolver::custom(System));
 
 async fn connect(relay: &RelayUrl, sk: SecretKey) -> Result<Client> {
+    ensure!(dialable(relay), "{relay}: a relay is reached by https");
     let local = loopback(relay);
-    ensure!(
-        relay.scheme() == "https" || local,
-        "{relay}: a relay is reached by https"
-    );
     // irnet's hybrid alone: a relay without it is refused, not met
     // classically, for this hop hides who is sent to from a recording.
     let tls = roots().client_config(irnet::pq())?;
@@ -617,8 +629,11 @@ mod tests {
             ("127.0.0.2", true),
             ("[::1]", true),
             ("localhost.", true),
+            ("0.0.0.0", true),
+            ("[::ffff:127.0.0.1]", true),
             ("127.office.example", false),
             ("[::2]", false),
+            ("[::ffff:10.0.0.1]", false),
         ] {
             assert_eq!(
                 loopback(&format!("http://{host}/").parse().unwrap()),
