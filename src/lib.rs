@@ -443,7 +443,8 @@ async fn session(
     let run = async {
         loop {
             ensure!(MOVES.load(SeqCst) == moves, "moved");
-            let quiet = heard.elapsed().unwrap_or_default();
+            // A clock set back: due now (its pong sets `heard` anew).
+            let quiet = heard.elapsed().unwrap_or(beat.wait);
             // Timers stop while the device sleeps: look at the clock again
             // within a minute of waking.
             let nap =
@@ -473,7 +474,7 @@ async fn session(
                 _ = KICK.notified() => kicked = true,
                 _ = MOVED.notified() => continue,
             }
-            let quiet = heard.elapsed().unwrap_or_default();
+            let quiet = heard.elapsed().unwrap_or(beat.wait);
             match ping {
                 Some((_, _, dead)) if Instant::now() >= dead => {
                     bail!("no pong")
