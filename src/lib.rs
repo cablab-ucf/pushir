@@ -509,7 +509,7 @@ const SEEN: usize = 256;
 /// once. The empty frame of a (re)connection is ours, never the relay's,
 /// so never taken for one.
 fn fresh(seen: &mut VecDeque<[u8; 24]>, nonce: &[u8]) -> bool {
-    let n: [u8; 24] = nonce.try_into().expect("24 bytes");
+    let Ok(n) = <[u8; 24]>::try_from(nonce) else { return true };
     if seen.contains(&n) {
         return false;
     }
