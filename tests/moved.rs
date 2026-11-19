@@ -17,6 +17,9 @@ async fn a_move_reconnects_at_once() {
     let s = Server::spawn(cfg).await.unwrap();
     let r: RelayUrl =
         format!("http://{}/", s.http_addr().unwrap()).parse().unwrap();
+    // SAFETY: the one test here, before any other thread reads it. A
+    // loopback relay is dialled only while the device's own is one.
+    unsafe { std::env::set_var("PUSHIR_RELAY", r.as_str()) };
     let sk = SecretKey::generate();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (r2, k) = (r.clone(), sk.clone());

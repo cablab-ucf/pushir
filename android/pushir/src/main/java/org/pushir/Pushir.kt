@@ -202,8 +202,10 @@ class Broker : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        Pushir.id(Native.start(File(filesDir, KEY).path))
-        reader
+        // A start that fails is said (`held`), never a crash.
+        failed = runCatching { Pushir.id(Native.start(File(filesDir, KEY).path)) }
+            .exceptionOrNull()?.let { "its mailbox did not start (${it.message})" }
+        if (failed == null) reader
         thread { beat(this) }
         getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(net)
     }
@@ -223,15 +225,25 @@ class Broker : Service() {
             .setSmallIcon(android.R.drawable.stat_notify_sync).build()
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
         else startForeground(1, n)
-        Pushir.refused = null
+        Pushir.refused = failed
         return START_STICKY
     }
 
     override fun onBind(i: Intent?): IBinder = Binder()
 
     companion object {
-        /** Frames, read on one thread for the process. */
-        private val reader by lazy { thread(isDaemon = true) { while (true) Pushir.frame(Native.next()) } }
+        @Volatile private var failed: String? = null
+
+        /** Frames, read on one thread for the process; a mailbox gone is said. */
+        private val reader by lazy {
+            thread(isDaemon = true) {
+                while (true) Pushir.frame(runCatching { Native.next() }.getOrElse {
+                    failed = "its mailbox stopped (${it.message})"
+                    Pushir.refused = failed
+                    return@thread
+                })
+            }
+        }
     }
 }
 

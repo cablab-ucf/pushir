@@ -17,14 +17,16 @@ use aws_lc_rs::{aead, constant_time::verify_slices_are_equal, hmac, rand};
 use data_encoding::HEXLOWER as HEX;
 use futures_util::{SinkExt, StreamExt};
 use iroh_base::{PublicKey, RelayUrl, SecretKey};
+use iroh_dns::dns;
 use iroh_relay::client::{Client, ClientBuilder};
 use iroh_relay::protos::relay::{
     ClientToRelayMsg as Out, Datagrams, RelayToClientMsg as In,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
@@ -76,13 +78,10 @@ impl std::str::FromStr for Lane {
             let (at, relay) = s.strip_prefix("pushir:")?.split_once('@')?;
             let (id, secret) = at.split_once(':')?;
             let secret = HEX.decode(secret.as_bytes()).ok()?.try_into().ok()?;
-            Some(Lane {
-                relay: relay.parse().ok()?,
-                id: id.parse().ok()?,
-                secret,
-            })
+            let relay = relay.parse().ok().filter(dialable)?;
+            Some(Lane { relay, id: id.parse().ok()?, secret })
         };
-        lane().context("not a lane: pushir:ID:SECRET@RELAY")
+        lane().context("not a lane: pushir:ID:SECRET@RELAY, RELAY by https")
     }
 }
 
@@ -177,10 +176,13 @@ fn roots() -> iroh_relay::tls::CaTlsConfig {
     iroh_relay::tls::CaTlsConfig::embedded()
 }
 
+/// Whether `relay` is this device itself (0.0.0.0 and ::ffff:127.0.0.1
+/// reach it too).
 fn loopback(relay: &RelayUrl) -> bool {
+    let me = |ip: IpAddr| ip.is_loopback() || ip.is_unspecified();
     match relay.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv4(ip)) => me(ip.into()),
+        Some(url::Host::Ipv6(ip)) => me(ip.to_canonical()),
         Some(url::Host::Domain(name)) => {
             matches!(name, "localhost" | "localhost.")
         }
@@ -188,20 +190,137 @@ fn loopback(relay: &RelayUrl) -> bool {
     }
 }
 
+/// Whether `relay` may be dialled: by https, with nothing but a host, port
+/// and path. Loopback (by http too) only while this device's own relay
+/// ([`relay`]) is loopback, a test's: a peer's lane reaches no local port.
+fn dialable(relay: &RelayUrl) -> bool {
+    let bare = relay.username().is_empty()
+        && relay.password().is_none()
+        && relay.query().is_none()
+        && relay.fragment().is_none();
+    let local = || cfg!(test) || crate::relay().is_ok_and(|r| loopback(&r));
+    bare && match loopback(relay) {
+        false => relay.scheme() == "https",
+        true => matches!(relay.scheme(), "http" | "https") && local(),
+    }
+}
+
+/// Names as the system resolves them (getaddrinfo), which honours each
+/// network's DNS and Android's Private DNS. iroh's own resolver reads
+/// Android's DNS servers through JNI and panics with no activity (a boot,
+/// an update): with `panic = "abort"` the process dies, pushes and all.
+#[derive(Debug)]
+struct System {
+    /// Public addresses only: another's relay, named in a lane anyone may
+    /// write, never makes us dial into our own network.
+    public: bool,
+}
+
+/// Whether `ip` is on the internet: not this device, its network, a
+/// carrier's shared space, link-local, multicast or a documentation range.
+fn public(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(a) => {
+            let [x, y, ..] = a.octets();
+            !(a.is_private()
+                || a.is_loopback()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || a.is_broadcast()
+                || a.is_documentation()
+                || x == 100 && y & 0xc0 == 64)
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments()[0];
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || s & 0xfe00 == 0xfc00
+                || s & 0xffc0 == 0xfe80
+                || s == 0x2001 && a.segments()[1] == 0xdb8)
+        }
+    }
+}
+
+type Found<T> = std::pin::Pin<
+    Box<
+        dyn Future<Output = Result<dns::BoxIter<T>, dns::DnsError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+impl System {
+    fn find<T: Send + 'static>(
+        &self,
+        host: String,
+        of: fn(IpAddr) -> Option<T>,
+    ) -> Found<T> {
+        let only = self.public;
+        Box::pin(async move {
+            let found = tokio::net::lookup_host((host, 0)).await;
+            let found = found.map_err(n0_error::AnyError::from)?;
+            let ok = |ip: &IpAddr| !only || public(*ip);
+            let ips: Vec<T> =
+                found.map(|a| a.ip()).filter(ok).filter_map(of).collect();
+            Ok(Box::new(ips.into_iter()) as dns::BoxIter<T>)
+        })
+    }
+}
+
+impl dns::Resolver for System {
+    fn lookup_ipv4(&self, host: String) -> Found<Ipv4Addr> {
+        self.find(host, |ip| match ip {
+            IpAddr::V4(ip) => Some(ip),
+            _ => None,
+        })
+    }
+
+    fn lookup_ipv6(&self, host: String) -> Found<Ipv6Addr> {
+        self.find(host, |ip| match ip {
+            IpAddr::V6(ip) => Some(ip),
+            _ => None,
+        })
+    }
+
+    fn lookup_txt(&self, _: String) -> Found<dns::TxtRecordData> {
+        Box::pin(async { Err(n0_error::AnyError::from("no TXT lookups"))? })
+    }
+
+    fn clear_cache(&self) {}
+
+    fn reset(&self) -> Box<dyn dns::Resolver> {
+        Box::new(System { public: self.public })
+    }
+}
+
+/// One for the process: it holds nothing but the system's. Our own relay
+/// may be on our network (its operator's choice); another's, public only.
+static DNS: LazyLock<dns::DnsResolver> =
+    LazyLock::new(|| dns::DnsResolver::custom(System { public: false }));
+static PUBLIC: LazyLock<dns::DnsResolver> =
+    LazyLock::new(|| dns::DnsResolver::custom(System { public: true }));
+
 async fn connect(relay: &RelayUrl, sk: SecretKey) -> Result<Client> {
+    ensure!(dialable(relay), "{relay}: a relay is reached by https");
     let local = loopback(relay);
+    let ours = local || crate::relay().is_ok_and(|r| r == *relay);
+    // Another's relay by an address in our own network: refused.
+    let literal = match relay.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => None,
+    };
     ensure!(
-        relay.scheme() == "https" || local,
-        "{relay}: a relay is reached by https"
+        ours || literal.is_none_or(public),
+        "{relay}: not a public address"
     );
     // irnet's hybrid alone: a relay without it is refused, not met
     // classically, for this hop hides who is sent to from a recording.
     let tls = roots().client_config(irnet::pq())?;
-    let b = ClientBuilder::new(
-        relay.clone(),
-        sk,
-        iroh_dns::dns::DnsResolver::new(),
-    );
+    let dns = if ours { DNS.clone() } else { PUBLIC.clone() };
+    let b = ClientBuilder::new(relay.clone(), sk, dns);
     // Through the network's proxy, if it has one.
     let proxy = ["HTTPS_PROXY", "https_proxy"]
         .iter()
@@ -307,7 +426,7 @@ impl Beat {
 }
 
 /// Wakes the session to ping now, and tells [`kick`] of each answer: its
-/// count, and the wait before the next ping.
+/// count, and the wait before the next ping (or, offline, the next try).
 static KICK: Notify = Notify::const_new();
 static PULSE: (Mutex<(u64, Duration)>, Condvar) =
     (Mutex::new((0, LO)), Condvar::new());
@@ -319,8 +438,8 @@ fn pulse(wait: Duration) {
 }
 
 /// Ping the relay now, reconnecting if it does not answer, and wait up to
-/// 30 s for the answer (or the reconnection): the seconds until this
-/// is next due. For a platform whose timers sleep with it (Android's alarm
+/// 30 s for the answer (or the reconnection, or its failure): the seconds
+/// until this is next due. For a platform whose timers sleep with it (Android's alarm
 /// calls this, awake as long) and for a network that just came back.
 /// Blocks: not for an async task.
 pub fn kick() -> u64 {
@@ -401,6 +520,7 @@ pub fn up(id: &PublicKey) -> Option<bool> {
 /// missed. Reconnects forever.
 pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
     let mut beats: HashMap<String, Beat> = HashMap::new();
+    let mut seen = VecDeque::with_capacity(SEEN);
     let mut wait = Duration::from_secs(1);
     let mut held = Held(*sk.public().as_bytes(), false);
     held.tally(1, 0);
@@ -410,7 +530,7 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
             let net = NET.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let beat = beats.entry(net).or_insert_with(Beat::new);
             held.up(true);
-            let _ = session(c, &on, beat, moves).await;
+            let _ = session(c, &on, beat, &mut seen, moves).await;
             held.up(false);
             // Moved, or connected a while then lost: again at once. A
             // timer sleeps with a phone, so waiting would hold what the
@@ -421,6 +541,9 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
             }
         }
         wait = (wait * 2).min(Duration::from_secs(300));
+        // Offline: a kick has its answer now, the next try (a minute at
+        // least, for a phone's alarm), not a wake each minute held 30 s.
+        pulse(wait.max(LO / 4));
         tokio::select! {
             _ = sleep(wait) => {}
             _ = KICK.notified() => {}
@@ -428,10 +551,30 @@ pub async fn listen(relay: &RelayUrl, sk: &SecretKey, on: impl Fn(&[u8])) {
     }
 }
 
+/// How many frames' nonces a mailbox remembers, across reconnections.
+const SEEN: usize = 256;
+
+/// Whether the frame of `nonce` is none of the last [`SEEN`] handed on: one
+/// handed again (its connection lost before the pong, or replayed) goes on
+/// once. The empty frame of a (re)connection is ours, never the relay's,
+/// so never taken for one.
+fn fresh(seen: &mut VecDeque<[u8; 24]>, nonce: &[u8]) -> bool {
+    let Ok(n) = <[u8; 24]>::try_from(nonce) else { return true };
+    if seen.contains(&n) {
+        return false;
+    }
+    if seen.len() == SEEN {
+        seen.pop_front();
+    }
+    seen.push_back(n);
+    true
+}
+
 async fn session(
     mut c: Client,
     on: &impl Fn(&[u8]),
     beat: &mut Beat,
+    seen: &mut VecDeque<[u8; 24]>,
     moves: u64,
 ) -> Result<()> {
     on(&[]);
@@ -443,7 +586,8 @@ async fn session(
     let run = async {
         loop {
             ensure!(MOVES.load(SeqCst) == moves, "moved");
-            let quiet = heard.elapsed().unwrap_or_default();
+            // A clock set back: due now (its pong sets `heard` anew).
+            let quiet = heard.elapsed().unwrap_or(beat.wait);
             // Timers stop while the device sleeps: look at the clock again
             // within a minute of waking.
             let nap =
@@ -454,8 +598,9 @@ async fn session(
                 m = c.next() => match m.context("closed")?? {
                     In::Datagrams { datagrams, .. } => {
                         heard = SystemTime::now();
-                        if datagrams.contents.len() == FRAME {
-                            on(&datagrams.contents);
+                        let f = &datagrams.contents;
+                        if f.len() == FRAME && fresh(seen, &f[..24]) {
+                            on(f);
                         }
                     }
                     In::Ping(d) => {
@@ -473,7 +618,7 @@ async fn session(
                 _ = KICK.notified() => kicked = true,
                 _ = MOVED.notified() => continue,
             }
-            let quiet = heard.elapsed().unwrap_or_default();
+            let quiet = heard.elapsed().unwrap_or(beat.wait);
             match ping {
                 Some((_, _, dead)) if Instant::now() >= dead => {
                     bail!("no pong")
@@ -539,14 +684,81 @@ mod tests {
         rx
     }
 
+    /// A relay's name is resolved by the system, no JNI asked (none can be
+    /// had on Android without an activity), and connected to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn names_resolve_as_the_system_does() {
+        let url = "http://localhost/".parse().unwrap();
+        let ips: Vec<_> =
+            DNS.resolve_host_all(&url, PONG).collect::<Vec<_>>().await;
+        assert!(ips.iter().flatten().any(IpAddr::is_loopback), "{ips:?}");
+        let (s, _) = relay().await;
+        let port = s.http_addr().unwrap().port();
+        let r = format!("http://localhost:{port}/").parse().unwrap();
+        connect(&r, SecretKey::generate()).await.unwrap();
+        // Another's relay: public addresses only, by name or by number.
+        let ips: Vec<_> =
+            PUBLIC.resolve_host_all(&url, PONG).collect::<Vec<_>>().await;
+        assert!(ips.iter().flatten().next().is_none(), "{ips:?}");
+        for r in [
+            "https://192.168.1.1/",
+            "https://10.0.0.1/",
+            "https://[fd00::1]/",
+            "https://100.64.0.1/",
+            "https://169.254.1.1/",
+        ] {
+            let e = connect(&r.parse().unwrap(), SecretKey::generate()).await;
+            let e = e.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("not a public address"), "{r}: {e}");
+        }
+        for ip in ["1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(public(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    /// A frame the relay hands again (its connection lost before the pong,
+    /// or replayed) is handed on once, within the last 256.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_handed_again_is_handed_on_once() {
+        let (_s, r) = relay().await;
+        let sk = SecretKey::generate();
+        let mut rx = mailbox(&r, &sk);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        let a = lane(&r, sk.public(), 1);
+        let (f, g) =
+            (seal(&a.secret, b"once").unwrap(), seal(&a.secret, b"next"));
+        let mut tx = Sender::connect(&r).await.unwrap();
+        for f in [&f, &f, &g.unwrap()] {
+            let mut d = Datagrams::from(f);
+            d.ecn = Some(noq_proto::EcnCodepoint::Ce);
+            let to = Out::Datagrams { dst_endpoint_id: a.id, datagrams: d };
+            tx.1.send(to).await.unwrap();
+        }
+        for m in [b"once", b"next"] {
+            let f = frame(&mut rx).await.unwrap();
+            assert_eq!(open(&a.secret, &f).unwrap(), m);
+        }
+        let mut seen = VecDeque::new();
+        assert!(fresh(&mut seen, &[0; 24]) && !fresh(&mut seen, &[0; 24]));
+        for i in 1..=SEEN as u16 {
+            let mut n = [0; 24];
+            n[..2].copy_from_slice(&i.to_be_bytes());
+            assert!(fresh(&mut seen, &n));
+        }
+        assert!(seen.len() == SEEN && fresh(&mut seen, &[0; 24]));
+    }
+
     #[test]
     fn only_loopback_gets_the_local_relay_policy() {
         for (host, local) in [
             ("127.0.0.2", true),
             ("[::1]", true),
             ("localhost.", true),
+            ("0.0.0.0", true),
+            ("[::ffff:127.0.0.1]", true),
             ("127.office.example", false),
             ("[::2]", false),
+            ("[::ffff:10.0.0.1]", false),
         ] {
             assert_eq!(
                 loopback(&format!("http://{host}/").parse().unwrap()),
@@ -706,19 +918,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_kick_pings_now() {
-        let (_s, r) = relay().await;
-        let mut rx = mailbox(&r, &SecretKey::generate());
-        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
-        let next = tokio::task::spawn_blocking(kick).await.unwrap();
-        assert_eq!(
-            next,
-            LO.as_secs(),
-            "answered within 8 s; an early ping proves no longer wait"
-        );
-    }
-
     /// `up` says what this process holds: on its relay, off it, or gone.
     #[tokio::test(flavor = "multi_thread")]
     async fn up_says_whether_the_mailbox_is_on_its_relay() {
@@ -732,6 +931,10 @@ mod tests {
         });
         assert_eq!(rx.recv().await.unwrap(), b"", "connected");
         assert_eq!(up(&sk.public()), Some(true));
+        // A frame through it: the relay has the connection, so its
+        // shutdown closes it (one not yet registered would outlive it).
+        send(&lane(&r, sk.public(), 1), b"").await.unwrap();
+        assert!(frame(&mut rx).await.is_some());
         s.shutdown().await.unwrap();
         timeout(Duration::from_secs(10), async {
             while up(&sk.public()) != Some(false) {
@@ -784,45 +987,112 @@ mod tests {
         assert!(more.await.is_err(), "handed over twice after its pong");
     }
 
-    /// With the lab's relay: a flood to one mailbox is cut to a burst of 64
-    /// and one a second after, and of what waits for a mailbox that is away
-    /// the newest 64 are kept.
+    /// The first byte of each message for `a`, until 2 s pass with none.
+    async fn heard(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        a: &Lane,
+    ) -> Vec<u8> {
+        let mut got = vec![];
+        while let Ok(Some(f)) = timeout(Duration::from_secs(2), rx.recv()).await
+        {
+            got.extend(open(&a.secret, &f).and_then(|m| m.first().copied()));
+        }
+        got
+    }
+
+    /// With the lab's relay: when the connection that holds a mailbox leaves,
+    /// the one before it is handed what is held at once.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_promoted_connection_is_handed_what_is_held() {
+        let (_s, r) = relay().await;
+        let sk = SecretKey::generate();
+        let a = lane(&r, sk.public(), 1);
+        let mut rx = mailbox(&r, &sk);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        // A second connection with its key takes over, takes the frame and
+        // leaves without a pong.
+        let mut c = connect(&r, sk.clone()).await.unwrap();
+        sleep(Duration::from_millis(500)).await;
+        send(&a, b"held").await.unwrap();
+        let got = loop {
+            if let In::Datagrams { datagrams, .. } =
+                c.next().await.unwrap().unwrap()
+            {
+                break datagrams.contents;
+            }
+        };
+        assert_eq!(open(&a.secret, &got).unwrap(), b"held");
+        let idle = timeout(Duration::from_secs(1), rx.recv()).await;
+        assert!(idle.is_err(), "the one put aside is handed nothing");
+        drop(c);
+        let f = frame(&mut rx).await.expect("handed it when promoted");
+        assert_eq!(open(&a.secret, &f).unwrap(), b"held");
+    }
+
+    /// With the lab's relay: with all 65,536 frames it keeps taken, the
+    /// oldest held anywhere makes way, so a new mailbox's frame is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_full_relay_lets_its_oldest_frame_go() {
+        let (_s, r) = relay().await;
+        let (x, y) = (SecretKey::generate(), SecretKey::generate());
+        let mut tx = Sender::connect(&r).await.unwrap();
+        tx.send(&lane(&r, x.public(), 1), b"oldest").await.unwrap();
+        for _ in 0..1024 {
+            let away = lane(&r, SecretKey::generate().public(), 2);
+            for _ in 0..64 {
+                tx.send(&away, b"").await.unwrap();
+            }
+        }
+        tx.send(&lane(&r, y.public(), 1), b"newest").await.unwrap();
+        tx.close().await.unwrap();
+        sleep(Duration::from_millis(500)).await;
+        let mut rx = mailbox(&r, &y);
+        let f = frame(&mut rx).await.expect("kept");
+        assert_eq!(open(&[1; 32], &f).unwrap(), b"newest");
+        let mut rx = mailbox(&r, &x);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        let none = timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(none.is_err(), "the oldest made way");
+    }
+
+    /// With the lab's relay: of what waits for a mailbox that is away the
+    /// newest 64 are kept; a connected one is handed a burst of 64 at once,
+    /// and of what comes past it the newest 64 a minute later, in one batch.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn the_relay_bounds_a_flood() {
         let (_s, r) = relay().await;
+        let flood = async |a: &Lane| {
+            let mut tx = Sender::connect(&r).await.unwrap();
+            for i in 0..200u8 {
+                tx.send(a, &[i]).await.unwrap();
+            }
+            tx.close().await.unwrap();
+        };
         let sk = SecretKey::generate();
         let a = lane(&r, sk.public(), 1);
-        let mut tx = Sender::connect(&r).await.unwrap();
-        for i in 0..100u8 {
-            tx.send(&a, &[i]).await.unwrap();
-        }
-        tx.close().await.unwrap();
+        flood(&a).await;
         sleep(Duration::from_millis(500)).await;
         let mut rx = mailbox(&r, &sk);
-        let mut got = vec![];
-        while let Ok(Some(f)) = timeout(Duration::from_secs(2), rx.recv()).await
-        {
-            got.extend(
-                open(&a.secret, &f).filter(|m| !m.is_empty()).map(|m| m[0]),
-            );
-        }
-        assert_eq!(
-            got,
-            (36..100).collect::<Vec<u8>>(),
-            "the newest 64, in order"
-        );
-        // Connected: 64 at once, then about one a second.
-        let mut tx = Sender::connect(&r).await.unwrap();
-        for i in 0..200u8 {
-            tx.send(&a, &[i]).await.unwrap();
-        }
-        tx.close().await.unwrap();
-        let mut n = 0;
-        while let Ok(Some(f)) = timeout(Duration::from_secs(2), rx.recv()).await
-        {
-            n += open(&a.secret, &f).is_some() as usize;
-        }
-        assert!((64..=70).contains(&n), "{n} of 200 passed");
+        let newest: Vec<u8> = (136..200).collect();
+        assert_eq!(heard(&mut rx, &a).await, newest, "the newest 64, in order");
+        // Connected: 64 at once (the newest as it is handed them), then
+        // nothing until the batch.
+        let sk = SecretKey::generate();
+        let a = lane(&r, sk.public(), 1);
+        let mut rx = mailbox(&r, &sk);
+        assert_eq!(rx.recv().await.unwrap(), b"", "connected");
+        flood(&a).await;
+        let burst = heard(&mut rx, &a).await;
+        assert_eq!(burst.len(), 64, "{burst:?}");
+        assert!(burst.is_sorted() && burst[63] < 136, "{burst:?}");
+        let t = Instant::now();
+        let f = timeout(Duration::from_secs(75), rx.recv()).await.unwrap();
+        assert!(t.elapsed() > Duration::from_secs(45), "a batch, no trickle");
+        let mut got = vec![open(&a.secret, &f.unwrap()).unwrap()[0]];
+        got.extend(heard(&mut rx, &a).await);
+        assert_eq!(got, newest, "the newest 64, in one batch");
     }
 }

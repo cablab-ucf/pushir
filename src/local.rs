@@ -30,38 +30,52 @@ pub fn sock() -> PathBuf {
 
 #[derive(Default)]
 struct Routes {
-    on: Vec<(Key, Sender<Vec<u8>>)>,
+    // Each attached lane, and whether it missed a frame (a full queue).
+    on: Vec<(Key, Sender<Vec<u8>>, bool)>,
     held: VecDeque<Vec<u8>>,
+    // A held frame made way: who attaches catches up.
+    lost: bool,
 }
 
 impl Routes {
     /// A frame goes to the attached lane that hears it; an app that reads
-    /// too slowly loses it, one that left gives its place up. Any other
-    /// frame waits, the oldest making way. Empty: a reconnection, for all.
+    /// too slowly is told to catch up (an empty frame, once it has room),
+    /// one that left gives its place up. Any other frame waits, the oldest
+    /// making way. Empty: a reconnection, for all.
     fn take(&mut self, f: &[u8]) {
         if f.is_empty() {
-            return self.on.retain(|(_, t)| {
-                !matches!(t.try_send(vec![]), Err(TrySendError::Closed(_)))
+            return self.on.retain_mut(|(_, t, missed)| {
+                let r = t.try_send(vec![]);
+                *missed &= r.is_err();
+                !matches!(r, Err(TrySendError::Closed(_)))
             });
         }
-        if let Some(i) = self.on.iter().position(|(k, _)| hears(k, f)) {
-            match self.on[i].1.try_send(f.to_vec()) {
+        if let Some(i) = self.on.iter().position(|(k, ..)| hears(k, f)) {
+            let (_, t, missed) = &mut self.on[i];
+            if *missed && t.try_send(vec![]).is_ok() {
+                *missed = false;
+            }
+            match t.try_send(f.to_vec()) {
                 Err(TrySendError::Closed(_)) => drop(self.on.swap_remove(i)),
-                _ => return,
+                r => return *missed |= r.is_err(),
             }
         }
         if self.held.len() == HELD {
             self.held.pop_front();
+            self.lost = true;
         }
         self.held.push_back(f.to_vec());
     }
 
     /// A lane attaches (its newest attachment has it): what waited for it.
     fn attach(&mut self, k: Key) -> Receiver<Vec<u8>> {
-        let (tx, rx) = channel(HELD);
-        self.on.retain(|(o, _)| *o != k);
+        let (tx, rx) = channel(HELD + 1);
+        self.on.retain(|(o, ..)| *o != k);
+        if self.lost {
+            let _ = tx.try_send(vec![]);
+        }
         self.held.retain(|f| !hears(&k, f) || tx.try_send(f.clone()).is_err());
-        self.on.push((k, tx));
+        self.on.push((k, tx, false));
         rx
     }
 }
@@ -211,16 +225,23 @@ mod tests {
         }
         assert_eq!(r.held.len(), HELD);
         let mut rx = r.attach(route(&[9; 32]));
+        // Some made way: told to catch up first.
+        assert_eq!(rx.try_recv().unwrap(), b"");
         let got = std::iter::from_fn(|| rx.try_recv().ok());
         let got: Vec<u8> =
             got.map(|f| open(&[9; 32], &f).unwrap()[0]).collect();
         assert_eq!(got, (6..70).collect::<Vec<u8>>());
         assert!(r.held.is_empty() && r.on.len() == 1);
-        // An app that does not read loses frames past 64; one that left, its place.
+        // An app that does not read misses frames past its queue, and is
+        // told to catch up once it reads again; one that left, its place.
         for i in 0..70 {
             r.take(&crate::seal(&[9; 32], &[i]).unwrap());
         }
-        assert!(r.held.is_empty());
+        assert!(r.held.is_empty() && r.on[0].2, "missed");
+        while rx.try_recv().is_ok() {}
+        r.take(&crate::seal(&[9; 32], b"next").unwrap());
+        assert_eq!(rx.try_recv().unwrap(), b"", "catch up first");
+        assert!(!r.on[0].2);
         drop(rx);
         r.take(&crate::seal(&[9; 32], b"kept").unwrap());
         assert!(r.held.len() == 1 && r.on.is_empty());

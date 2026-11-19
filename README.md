@@ -94,7 +94,9 @@ then `make update`) or Debian (`deploy/debian.sh`). Set `deploy/config.nix`.
   cannot go direct.
 - `relay-hold`: keeps a pushir frame (marked ECN-CE, which no QUIC sender
   sets, so iroh's traffic is never touched) until its mailbox pongs it;
-  hands a connected mailbox 64 at once, then one a second; 65,536 in all.
+  hands a connected mailbox 64 at once, then one a second, and what comes
+  past that (the newest 64) in one batch a minute later; 65,536 in all,
+  the oldest anywhere making way.
 
 It is an iroh relay still, and the one with post-quantum TLS: irnet homes
 every endpoint there first (then on iroh.cxn.center, then n0's).

@@ -1355,8 +1355,8 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "irnet"
-version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/irnet?rev=7f8c000428461e8000657866620952d4dad247d5#7f8c000428461e8000657866620952d4dad247d5"
+version = "0.5.0"
+source = "git+https://github.com/cablab-ucf/irnet?rev=3b962fb55562589d5af801a4a8f29214c2b8e55e#3b962fb55562589d5af801a4a8f29214c2b8e55e"
 dependencies = [
  "iroh",
  "rustls",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "pushir"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -2494,6 +2494,7 @@ dependencies = [
  "iroh-dns",
  "iroh-relay",
  "jni 0.22.4",
+ "n0-error",
  "noq-proto",
  "tokio",
  "url",

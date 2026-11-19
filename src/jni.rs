@@ -12,8 +12,8 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use tokio::sync::watch;
 
 static RX: OnceLock<Mutex<mpsc::Receiver<Vec<u8>>>> = OnceLock::new();
-/// The mailbox's id, or why it did not start: started once only.
-static ID: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+/// The mailbox's id, once started (a failed start is tried again).
+static ID: Mutex<Option<String>> = Mutex::new(None);
 /// Whether the mailbox is held: while its broker runs. Let go, its
 /// connection is closed, so the group's next owner holds it alone.
 static HELD: OnceLock<watch::Sender<bool>> = OnceLock::new();
@@ -36,8 +36,21 @@ fn start(
     std::thread::spawn(move || {
         let rt =
             tokio::runtime::Builder::new_current_thread().enable_all().build();
-        let frame = |f: &[u8]| drop(tx.try_send(f.to_vec()));
-        rt.expect("tokio").block_on(async {
+        // Never lost unsaid: past a full queue, an empty frame (catch up)
+        // goes first once there is room.
+        let missed = std::sync::atomic::AtomicBool::new(false);
+        let frame = |f: &[u8]| {
+            use std::sync::atomic::Ordering::Relaxed;
+            if missed.load(Relaxed) && tx.try_send(vec![]).is_ok() {
+                missed.store(false, Relaxed);
+            }
+            if tx.try_send(f.to_vec()).is_err() {
+                missed.store(true, Relaxed);
+            }
+        };
+        // No runtime: `tx` dropped, `next` says so (never a panic).
+        let Ok(rt) = rt else { return };
+        rt.block_on(async {
             loop {
                 let _ = on.wait_for(|h| *h).await;
                 tokio::select! {
@@ -65,11 +78,13 @@ pub extern "system" fn Java_org_pushir_Native_start<'l>(
     env.with_env(|env: &mut Env<'l>| -> Result<_> {
         let path = path.to_string();
         held().send_replace(true);
-        let id = ID.get_or_init(|| {
-            let id = crate::relay().and_then(|r| start(path.as_ref(), r));
-            id.map_err(|e| format!("{e:#}"))
-        });
-        env.new_string(id.clone().map_err(Error::ParseFailed)?)
+        // Started once; a failed start is tried again.
+        let mut id = ID.lock().map_err(|_| Error::ParseFailed("id".into()))?;
+        if id.is_none() {
+            let r = crate::relay().and_then(|r| start(path.as_ref(), r));
+            *id = Some(r.map_err(|e| Error::ParseFailed(format!("{e:#}")))?);
+        }
+        env.new_string(id.clone().unwrap_or_default())
     })
     .resolve::<Throw>()
 }
