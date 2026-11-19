@@ -210,7 +210,38 @@ fn dialable(relay: &RelayUrl) -> bool {
 /// Android's DNS servers through JNI and panics with no activity (a boot,
 /// an update): with `panic = "abort"` the process dies, pushes and all.
 #[derive(Debug)]
-struct System;
+struct System {
+    /// Public addresses only: another's relay, named in a lane anyone may
+    /// write, never makes us dial into our own network.
+    public: bool,
+}
+
+/// Whether `ip` is on the internet: not this device, its network, a
+/// carrier's shared space, link-local, multicast or a documentation range.
+fn public(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(a) => {
+            let [x, y, ..] = a.octets();
+            !(a.is_private()
+                || a.is_loopback()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || a.is_broadcast()
+                || a.is_documentation()
+                || x == 100 && y & 0xc0 == 64)
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments()[0];
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || s & 0xfe00 == 0xfc00
+                || s & 0xffc0 == 0xfe80
+                || s == 0x2001 && a.segments()[1] == 0xdb8)
+        }
+    }
+}
 
 type Found<T> = std::pin::Pin<
     Box<
@@ -222,13 +253,17 @@ type Found<T> = std::pin::Pin<
 
 impl System {
     fn find<T: Send + 'static>(
+        &self,
         host: String,
         of: fn(IpAddr) -> Option<T>,
     ) -> Found<T> {
+        let only = self.public;
         Box::pin(async move {
             let found = tokio::net::lookup_host((host, 0)).await;
             let found = found.map_err(n0_error::AnyError::from)?;
-            let ips: Vec<T> = found.filter_map(|a| of(a.ip())).collect();
+            let ok = |ip: &IpAddr| !only || public(*ip);
+            let ips: Vec<T> =
+                found.map(|a| a.ip()).filter(ok).filter_map(of).collect();
             Ok(Box::new(ips.into_iter()) as dns::BoxIter<T>)
         })
     }
@@ -236,14 +271,14 @@ impl System {
 
 impl dns::Resolver for System {
     fn lookup_ipv4(&self, host: String) -> Found<Ipv4Addr> {
-        Self::find(host, |ip| match ip {
+        self.find(host, |ip| match ip {
             IpAddr::V4(ip) => Some(ip),
             _ => None,
         })
     }
 
     fn lookup_ipv6(&self, host: String) -> Found<Ipv6Addr> {
-        Self::find(host, |ip| match ip {
+        self.find(host, |ip| match ip {
             IpAddr::V6(ip) => Some(ip),
             _ => None,
         })
@@ -256,21 +291,36 @@ impl dns::Resolver for System {
     fn clear_cache(&self) {}
 
     fn reset(&self) -> Box<dyn dns::Resolver> {
-        Box::new(System)
+        Box::new(System { public: self.public })
     }
 }
 
-/// One for the process: it holds nothing but the system's.
+/// One for the process: it holds nothing but the system's. Our own relay
+/// may be on our network (its operator's choice); another's, public only.
 static DNS: LazyLock<dns::DnsResolver> =
-    LazyLock::new(|| dns::DnsResolver::custom(System));
+    LazyLock::new(|| dns::DnsResolver::custom(System { public: false }));
+static PUBLIC: LazyLock<dns::DnsResolver> =
+    LazyLock::new(|| dns::DnsResolver::custom(System { public: true }));
 
 async fn connect(relay: &RelayUrl, sk: SecretKey) -> Result<Client> {
     ensure!(dialable(relay), "{relay}: a relay is reached by https");
     let local = loopback(relay);
+    let ours = local || crate::relay().is_ok_and(|r| r == *relay);
+    // Another's relay by an address in our own network: refused.
+    let literal = match relay.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => None,
+    };
+    ensure!(
+        ours || literal.is_none_or(public),
+        "{relay}: not a public address"
+    );
     // irnet's hybrid alone: a relay without it is refused, not met
     // classically, for this hop hides who is sent to from a recording.
     let tls = roots().client_config(irnet::pq())?;
-    let b = ClientBuilder::new(relay.clone(), sk, DNS.clone());
+    let dns = if ours { DNS.clone() } else { PUBLIC.clone() };
+    let b = ClientBuilder::new(relay.clone(), sk, dns);
     // Through the network's proxy, if it has one.
     let proxy = ["HTTPS_PROXY", "https_proxy"]
         .iter()
@@ -646,6 +696,24 @@ mod tests {
         let port = s.http_addr().unwrap().port();
         let r = format!("http://localhost:{port}/").parse().unwrap();
         connect(&r, SecretKey::generate()).await.unwrap();
+        // Another's relay: public addresses only, by name or by number.
+        let ips: Vec<_> =
+            PUBLIC.resolve_host_all(&url, PONG).collect::<Vec<_>>().await;
+        assert!(ips.iter().flatten().next().is_none(), "{ips:?}");
+        for r in [
+            "https://192.168.1.1/",
+            "https://10.0.0.1/",
+            "https://[fd00::1]/",
+            "https://100.64.0.1/",
+            "https://169.254.1.1/",
+        ] {
+            let e = connect(&r.parse().unwrap(), SecretKey::generate()).await;
+            let e = e.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("not a public address"), "{r}: {e}");
+        }
+        for ip in ["1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(public(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     /// A frame the relay hands again (its connection lost before the pong,
